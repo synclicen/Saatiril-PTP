@@ -156,7 +156,8 @@ fun OperatorCameraScreen(
     val textureView = remember { TextureView(context) }
     val uvcConnected by opViewModel.cameraUVCManager.isConnected.collectAsState()
     val c2Connected by opViewModel.camera2Manager.isConnected.collectAsState()
-    val cameraConnected = if (activeEngine == "uvc") uvcConnected else c2Connected
+    val ptpConnected by opViewModel.ptpCameraManager.isConnected.collectAsState()
+    val cameraConnected = when (activeEngine) { "uvc" -> uvcConnected; "camera2" -> c2Connected; else -> ptpConnected }
 
     var showCameraPicker by remember { mutableStateOf(false) }
     var showQueuePanel by remember { mutableStateOf(false) }
@@ -177,41 +178,47 @@ fun OperatorCameraScreen(
             opViewModel.camera2Manager.setProjectAspectRatio(ar)
             opViewModel.camera2Manager.setTextureView(textureView)
             opViewModel.cameraUVCManager.setTextureView(textureView)
+            opViewModel.ptpCameraManager.setTextureView(textureView)
 
             // BUG FIX: TextureView keeps only ONE surfaceTextureListener — the
             // second setTextureView call above replaced Camera2's, so Camera2
             // never received surface events (intermittent permanent black
             // preview). Install ONE shared listener LAST that fans the events
-            // out to BOTH managers.
+            // out to ALL managers.
             textureView.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
                 override fun onSurfaceTextureAvailable(surface: SurfaceTexture, width: Int, height: Int) {
                     opViewModel.camera2Manager.onSurfaceTextureAvailable(width, height)
                     opViewModel.cameraUVCManager.onSurfaceTextureAvailable(surface, width, height)
+                    opViewModel.ptpCameraManager.onSurfaceTextureAvailable(width, height)
                 }
 
                 override fun onSurfaceTextureSizeChanged(surface: SurfaceTexture, width: Int, height: Int) {
                     opViewModel.camera2Manager.onSurfaceTextureSizeChanged(width, height)
                     opViewModel.cameraUVCManager.onSurfaceTextureSizeChanged(surface, width, height)
+                    opViewModel.ptpCameraManager.onSurfaceTextureSizeChanged(width, height)
                 }
 
                 override fun onSurfaceTextureDestroyed(surface: SurfaceTexture): Boolean {
                     val c2Handled = opViewModel.camera2Manager.onSurfaceTextureDestroyed()
                     val uvcHandled = opViewModel.cameraUVCManager.onSurfaceTextureDestroyed()
-                    return c2Handled && uvcHandled
+                    val ptpHandled = opViewModel.ptpCameraManager.onSurfaceTextureDestroyed()
+                    return c2Handled && uvcHandled && ptpHandled
                 }
 
                 override fun onSurfaceTextureUpdated(surface: SurfaceTexture) {
-                    // Called on every frame — no-op (both managers no-op here)
+                    // Called on every frame — no-op (all managers no-op here)
                 }
             }
 
             opViewModel.camera2Manager.enumerateCameras()
             opViewModel.cameraUVCManager.initCamera()
+            opViewModel.ptpCameraManager.initCamera()
             opViewModel.camera2Manager.openCamera()
         }
         onDispose {
             try { opViewModel.camera2Manager.closeCamera() } catch (_: Exception) {}
             try { opViewModel.cameraUVCManager.hidePreview() } catch (_: Exception) {}
+            try { opViewModel.ptpCameraManager.closeCamera() } catch (_: Exception) {}
             try { HandTriggerDetector.stop() } catch (_: Exception) {}
         }
     }
@@ -473,6 +480,7 @@ fun OperatorCameraScreen(
                                         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                                             Icon(
                                                 when {
+                                                    displayName.contains("PTP", ignoreCase = true) -> Icons.Default.PhotoCamera
                                                     displayName.contains("USB", ignoreCase = true) -> Icons.Default.Usb
                                                     displayName.contains("Depan", ignoreCase = true) -> Icons.Default.CameraFront
                                                     else -> Icons.Default.CameraAlt

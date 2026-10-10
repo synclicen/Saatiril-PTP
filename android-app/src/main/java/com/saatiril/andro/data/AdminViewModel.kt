@@ -11,6 +11,7 @@ import com.google.gson.Gson
 import com.google.gson.JsonElement
 import com.google.gson.JsonObject
 import com.saatiril.andro.camera.Camera2Manager
+import com.saatiril.andro.camera.PTPCameraManager
 import com.saatiril.andro.camera.UVCCameraManager
 import com.saatiril.andro.server.ClientInfo
 import com.saatiril.andro.server.SaatirilServer
@@ -95,32 +96,50 @@ class AdminViewModel(application: Application) : AndroidViewModel(application) {
     val cameraUVCManager = UVCCameraManager(application)
     val camera2Manager = Camera2Manager(application)
 
-    /** Combined list of (cameraId, displayName) from both managers. */
+    // PTP: direct DSLR control over USB (Picture Transfer Protocol)
+    val ptpCameraManager = PTPCameraManager(application)
+
+    /** Combined list of (cameraId, displayName) from all managers (PTP + UVC + Camera2). */
     private val _availableCameras = MutableStateFlow<List<Pair<String, String>>>(emptyList())
     val availableCameras: StateFlow<List<Pair<String, String>>> = _availableCameras.asStateFlow()
 
-    /** "uvc" or "camera2" — which engine is currently active. */
+    /** "uvc" / "camera2" / "ptp" — which engine is currently active. */
     private val _activeCameraEngine = MutableStateFlow<String>("camera2")
     val activeCameraEngine: StateFlow<String> = _activeCameraEngine.asStateFlow()
 
     /** The current camera ID (from whichever engine is active). */
     val currentCameraId: StateFlow<String>
-        get() = if (_activeCameraEngine.value == "camera2") camera2Manager.currentCameraIdFlow
-                else cameraUVCManager.currentCameraIdFlow
+        get() = when (_activeCameraEngine.value) {
+            "camera2" -> camera2Manager.currentCameraIdFlow
+            "ptp" -> ptpCameraManager.currentCameraIdFlow
+            else -> cameraUVCManager.currentCameraIdFlow
+        }
 
-    /** "uvc" / "builtin" / "none" — human-readable camera source label. */
+    /** "uvc" / "builtin" / "ptp" / "none" — human-readable camera source label. */
     private val _cameraSource = MutableStateFlow<String>("builtin")
     val cameraSource: StateFlow<String> = _cameraSource.asStateFlow()
 
-    /** Refresh the combined camera list from both managers. */
+    /** Refresh the combined camera list from all engines (PTP + UVC + Camera2). */
     fun refreshAvailableCameras() {
+        val ptpList = ptpCameraManager.availableCameras.value
         val uvcList = cameraUVCManager.availableCameras.value
         val c2List = camera2Manager.availableCameras.value
-        _availableCameras.value = uvcList + c2List
+        _availableCameras.value = ptpList + uvcList + c2List
     }
 
-    /** Switch to a specific camera by ID (handles both UVC and Camera2). */
+    /** Switch to a specific camera by ID (handles PTP, UVC, and Camera2). */
     fun switchToCameraById(cameraId: String) {
+        // PTP camera (ID starts with "ptp:")
+        if (cameraId.startsWith("ptp:")) {
+            Log.i(TAG, "switchToCameraById: PTP $cameraId")
+            _activeCameraEngine.value = "ptp"
+            try { cameraUVCManager.hidePreview() } catch (_: Exception) {}
+            try { camera2Manager.closeCamera() } catch (_: Exception) {}
+            ptpCameraManager.switchCamera(cameraId)
+            _cameraSource.value = "ptp"
+            return
+        }
+
         val c2Cameras = camera2Manager.availableCameras.value
         val isCamera2 = c2Cameras.any { it.first == cameraId }
         if (isCamera2) {
@@ -142,6 +161,7 @@ class AdminViewModel(application: Application) : AndroidViewModel(application) {
     fun forceRescanUsbCamera() {
         Log.i(TAG, "forceRescanUsbCamera")
         cameraUVCManager.forceRescan()
+        ptpCameraManager.forceRescan()
         refreshAvailableCameras()
     }
 

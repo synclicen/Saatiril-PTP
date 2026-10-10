@@ -114,10 +114,11 @@ fun AdminOperatorScreen(viewModel: AdminViewModel, modifier: Modifier = Modifier
     val currentCameraId by viewModel.currentCameraId.collectAsState()
     val uvcConnected by viewModel.cameraUVCManager.isConnected.collectAsState()
     val c2Connected by viewModel.camera2Manager.isConnected.collectAsState()
+    val ptpConnected by viewModel.ptpCameraManager.isConnected.collectAsState()
     val frameBitmap by viewModel.frameBitmap.collectAsState()
     var showCameraPicker by remember { mutableStateOf(false) }
 
-    val cameraConnected = if (activeEngine == "uvc") uvcConnected else c2Connected
+    val cameraConnected = when (activeEngine) { "uvc" -> uvcConnected; "camera2" -> c2Connected; else -> ptpConnected }
 
     var capturedBitmap by remember { mutableStateOf<android.graphics.Bitmap?>(null) }
     var captureError by remember { mutableStateOf<String?>(null) }
@@ -261,6 +262,19 @@ fun AdminOperatorScreen(viewModel: AdminViewModel, modifier: Modifier = Modifier
     LaunchedEffect(activeStudentId) {
         viewModel.resetCaptureState()
     }
+    // ── rememberUpdatedState refs — reads ALWAYS use the CURRENT values ──
+    // Used by (1) the async PTP capture path inside triggerCapture below
+    // (DSLR capture takes seconds — values may change while in flight) and
+    // (2) the hand-trigger DisposableEffect further down (it only re-runs
+    // when shutterMode changes, so capturing activeStudent etc. directly
+    // froze them at the moment hand mode was entered — after MC called the
+    // next student, photos were attributed to the WRONG student). Reading
+    // through the updated State references always uses the CURRENT values.
+    val currentActiveStudent by rememberUpdatedState(activeStudent)
+    val currentActiveChannel by rememberUpdatedState(activeChannel)
+    val currentProject by rememberUpdatedState(project)
+    val currentFrameBitmap by rememberUpdatedState(frameBitmap)
+
     // ── Hot shoe: extract the capture logic into a reusable lambda ──
     // (used by both the on-screen shutter button + the hot shoe audio detector).
     val triggerCapture: () -> Unit = {
@@ -268,18 +282,64 @@ fun AdminOperatorScreen(viewModel: AdminViewModel, modifier: Modifier = Modifier
             captureError = null
             val timerDuration = when (shutterMode) { "timer-3" -> 3; "timer-5" -> 5; "timer-10" -> 10; else -> 0 }
             val doCapture: () -> Unit = {
-                isCapturing = true
-                try {
-                    val bitmap = textureView.bitmap
-                    val proj = project
-                    if (bitmap != null && proj != null) {
-                        val processed = try { CameraCapture.processFrame(bitmap, proj.config, frameBitmap) } catch (e: Exception) { bitmap }
-                        val base64 = CameraCapture.bitmapToBase64(processed, 95)
-                        showFlash = true
-                        scope.launch { delay(200); showFlash = false }
-                        viewModel.handleLocalCapture(activeStudent!!, base64, activeChannel)
-                    } else { captureError = if (bitmap == null) "Preview belum siap." else "Proyek tidak ditemukan." }
-                } catch (e: Exception) { captureError = "Gagal: ${e.message}" } finally { isCapturing = false }
+                if (viewModel.activeCameraEngine.value == "ptp" && viewModel.ptpCameraManager.isConnected.value) {
+                    // PTP path: trigger the DSLR shutter over USB, then process
+                    // the full-res photo ASYNC (DSLR autofocus takes seconds).
+                    isCapturing = true
+                    captureError = null
+                    viewModel.ptpCameraManager.capturePhoto { dataUrl ->
+                        if (dataUrl == null) {
+                            val reason = viewModel.ptpCameraManager.lastError.value
+                            captureError = "PTP capture gagal${if (reason != null) ": $reason" else ""}"
+                            isCapturing = false
+                            return@capturePhoto
+                        }
+                        scope.launch(Dispatchers.Default) {
+                            try {
+                                val pure = if (dataUrl.contains(",")) dataUrl.substringAfter(",") else dataUrl
+                                val bytes = Base64.decode(pure, Base64.DEFAULT)
+                                val source = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                                if (source == null) {
+                                    captureError = "Gagal decode foto PTP"
+                                    return@launch
+                                }
+                                val proj = currentProject
+                                val processed = if (proj != null) {
+                                    try { CameraCapture.processFrame(source, proj.config, currentFrameBitmap) } catch (e: Exception) { source }
+                                } else source
+                                val base64 = CameraCapture.bitmapToBase64(processed, 95)
+                                if (processed !== source) processed.recycle()
+                                source.recycle()
+                                showFlash = true
+                                scope.launch { delay(200); showFlash = false }
+                                val student = currentActiveStudent
+                                if (student != null) {
+                                    viewModel.handleLocalCapture(student, base64, currentActiveChannel)
+                                } else {
+                                    captureError = "Tidak ada mahasiswa aktif"
+                                }
+                            } catch (e: Exception) {
+                                captureError = "Gagal: ${e.message}"
+                            } finally {
+                                isCapturing = false
+                            }
+                        }
+                    }
+                } else {
+                    // Existing Camera2/UVC path — textureView bitmap grab
+                    isCapturing = true
+                    try {
+                        val bitmap = textureView.bitmap
+                        val proj = project
+                        if (bitmap != null && proj != null) {
+                            val processed = try { CameraCapture.processFrame(bitmap, proj.config, frameBitmap) } catch (e: Exception) { bitmap }
+                            val base64 = CameraCapture.bitmapToBase64(processed, 95)
+                            showFlash = true
+                            scope.launch { delay(200); showFlash = false }
+                            viewModel.handleLocalCapture(activeStudent!!, base64, activeChannel)
+                        } else { captureError = if (bitmap == null) "Preview belum siap." else "Proyek tidak ditemukan." }
+                    } catch (e: Exception) { captureError = "Gagal: ${e.message}" } finally { isCapturing = false }
+                }
             }
             if (timerDuration > 0) {
                 timerCountdown = timerDuration
@@ -371,16 +431,10 @@ fun AdminOperatorScreen(viewModel: AdminViewModel, modifier: Modifier = Modifier
     }
 
     // Wire hand trigger callback — when hand leaves frame, trigger capture.
-    // rememberUpdatedState: the DisposableEffect below only re-runs when
-    // shutterMode changes, so capturing activeStudent etc. directly froze
-    // them at the moment hand mode was entered — after MC called the next
-    // student, photos were attributed to the WRONG student. Reading through
-    // the updated State references always uses the CURRENT values.
-    val currentActiveStudent by rememberUpdatedState(activeStudent)
-    val currentActiveChannel by rememberUpdatedState(activeChannel)
-    val currentProject by rememberUpdatedState(project)
-    val currentFrameBitmap by rememberUpdatedState(frameBitmap)
-
+    // (reads currentActiveStudent / currentActiveChannel / currentProject /
+    // currentFrameBitmap via the rememberUpdatedState refs declared above
+    // the triggerCapture lambda — this DisposableEffect only re-runs when
+    // shutterMode changes, so direct captures would freeze stale values)
     DisposableEffect(shutterMode) {
         if (shutterMode == "hand") {
             com.saatiril.andro.camera.HandTriggerDetector.onHandLeft = {
@@ -435,36 +489,41 @@ fun AdminOperatorScreen(viewModel: AdminViewModel, modifier: Modifier = Modifier
             // Bind TextureView to both managers + enumerate + open default (back camera)
             viewModel.camera2Manager.setTextureView(textureView)
             viewModel.cameraUVCManager.setTextureView(textureView)
+            viewModel.ptpCameraManager.setTextureView(textureView)
 
             // BUG FIX: TextureView keeps only ONE surfaceTextureListener — the
             // second setTextureView call above replaced Camera2's, so Camera2
             // never received surface events (intermittent permanent black
             // preview). Install ONE shared listener LAST that fans the events
-            // out to BOTH managers.
+            // out to ALL managers.
             textureView.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
                 override fun onSurfaceTextureAvailable(surface: SurfaceTexture, width: Int, height: Int) {
                     viewModel.camera2Manager.onSurfaceTextureAvailable(width, height)
                     viewModel.cameraUVCManager.onSurfaceTextureAvailable(surface, width, height)
+                    viewModel.ptpCameraManager.onSurfaceTextureAvailable(width, height)
                 }
 
                 override fun onSurfaceTextureSizeChanged(surface: SurfaceTexture, width: Int, height: Int) {
                     viewModel.camera2Manager.onSurfaceTextureSizeChanged(width, height)
                     viewModel.cameraUVCManager.onSurfaceTextureSizeChanged(surface, width, height)
+                    viewModel.ptpCameraManager.onSurfaceTextureSizeChanged(width, height)
                 }
 
                 override fun onSurfaceTextureDestroyed(surface: SurfaceTexture): Boolean {
                     val c2Handled = viewModel.camera2Manager.onSurfaceTextureDestroyed()
                     val uvcHandled = viewModel.cameraUVCManager.onSurfaceTextureDestroyed()
-                    return c2Handled && uvcHandled
+                    val ptpHandled = viewModel.ptpCameraManager.onSurfaceTextureDestroyed()
+                    return c2Handled && uvcHandled && ptpHandled
                 }
 
                 override fun onSurfaceTextureUpdated(surface: SurfaceTexture) {
-                    // Called on every frame — no-op (both managers no-op here)
+                    // Called on every frame — no-op (all managers no-op here)
                 }
             }
 
             viewModel.camera2Manager.enumerateCameras()
             viewModel.cameraUVCManager.initCamera()
+            viewModel.ptpCameraManager.initCamera()
             viewModel.refreshAvailableCameras()
             viewModel.camera2Manager.openCamera()
         }
@@ -474,6 +533,7 @@ fun AdminOperatorScreen(viewModel: AdminViewModel, modifier: Modifier = Modifier
             timerJob = null
             try { viewModel.camera2Manager.closeCamera() } catch (_: Exception) {}
             try { viewModel.cameraUVCManager.hidePreview() } catch (_: Exception) {}
+            try { viewModel.ptpCameraManager.closeCamera() } catch (_: Exception) {}
         }
     }
 
@@ -660,7 +720,7 @@ fun AdminOperatorScreen(viewModel: AdminViewModel, modifier: Modifier = Modifier
                 horizontalArrangement = Arrangement.spacedBy(3.dp)
             ) {
                 Box(Modifier.size(5.dp).clip(RoundedCornerShape(2.dp)).background(if (cameraConnected) GREEN else RED))
-                val srcLabel = when (cameraSource) { "uvc" -> "USB"; "builtin" -> "HP"; else -> "-" }
+                val srcLabel = when (cameraSource) { "uvc" -> "USB"; "builtin" -> "HP"; "ptp" -> "PTP"; else -> "-" }
                 Text(
                     "Ch.$activeChannel • $srcLabel ${if (cameraConnected) "●" else "○"}",
                     style = TextStyle(color = Color.White, fontSize = 9.sp)
@@ -742,6 +802,7 @@ fun AdminOperatorScreen(viewModel: AdminViewModel, modifier: Modifier = Modifier
                                     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                                         Icon(
                                             when {
+                                                displayName.contains("PTP", ignoreCase = true) -> Icons.Default.PhotoCamera
                                                 isUsb -> Icons.Default.Usb
                                                 displayName.contains("Depan", ignoreCase = true) -> Icons.Default.CameraFront
                                                 else -> Icons.Default.CameraAlt

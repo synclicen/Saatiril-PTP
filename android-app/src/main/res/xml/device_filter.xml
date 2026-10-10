@@ -39,6 +39,26 @@
     <usb-device vendor-id="5965" />   <!-- Elgato (0x174D) -->
 
     <!-- ═══════════════════════════════════════════════════════════════
+         PTP (Picture Transfer Protocol, ISO 15740 / "Still Image" class)
+         DSLR/mirrorless cameras connected directly over USB.
+         Class 6 (0x06), Subclass 1 — the standard PIMA 15740 interface.
+         Vendor IDs are for cameras that expose PTP on vendor-specific
+         interfaces instead of the standard class.
+         Values are in DECIMAL.
+         ═══════════════════════════════════════════════════════════════ -->
+    <usb-device class="6" subclass="1" protocol="1" />  <!-- PTP still-image (standard) -->
+    <usb-device class="6" subclass="1" protocol="0" />  <!-- PTP (some bodies) -->
+    <usb-device class="6" subclass="1" protocol="255" /> <!-- PTP vendor-specific protocol -->
+    <usb-device vendor-id="1193" />  <!-- Canon (0x04A9) -->
+    <usb-device vendor-id="1200" />  <!-- Nikon (0x04B0) -->
+    <usb-device vendor-id="1356" />  <!-- Sony (0x054C) -->
+    <usb-device vendor-id="1227" />  <!-- Fujifilm (0x04CB) -->
+    <usb-device vendor-id="1972" />  <!-- Olympus (0x07B4) -->
+    <usb-device vendor-id="1242" />  <!-- Panasonic (0x04DA) -->
+    <usb-device vendor-id="1498" />  <!-- Ricoh/Pentax (0x05DA) -->
+    <usb-device vendor-id="1256" />  <!-- Samsung (0x04E8) -->
+
+    <!-- ═══════════════════════════════════════════════════════════════
          BROAD CATCH-ALL: Any USB device with video class interface.
          This ensures even unknown capture cards get detected.
          The app's isUVCDevice() method does further filtering.

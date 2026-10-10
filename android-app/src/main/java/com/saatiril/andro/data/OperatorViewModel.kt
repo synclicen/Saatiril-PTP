@@ -10,6 +10,7 @@ import androidx.lifecycle.viewModelScope
 import com.saatiril.andro.camera.Camera2Manager
 import com.saatiril.andro.camera.CameraCapture
 import com.saatiril.andro.camera.HandTriggerDetector
+import com.saatiril.andro.camera.PTPCameraManager
 import com.saatiril.andro.camera.UVCCameraManager
 import com.saatiril.andro.util.FilenameUtils
 import kotlinx.coroutines.Job
@@ -59,6 +60,9 @@ class OperatorViewModel(application: Application) : AndroidViewModel(application
 
     val cameraUVCManager = UVCCameraManager(application)
     val camera2Manager = Camera2Manager(application)
+
+    // PTP: direct DSLR control over USB (Picture Transfer Protocol)
+    val ptpCameraManager = PTPCameraManager(application)
 
     // ─── Connection State ───────────────────────────────────────
 
@@ -231,12 +235,17 @@ class OperatorViewModel(application: Application) : AndroidViewModel(application
         // Keep the hoisted flow in sync with whichever engine is active.
         viewModelScope.launch {
             cameraUVCManager.currentCameraIdFlow.collect { id ->
-                if (_activeCameraEngine.value != "camera2") _currentCameraId.value = id
+                if (_activeCameraEngine.value == "uvc") _currentCameraId.value = id
             }
         }
         viewModelScope.launch {
             camera2Manager.currentCameraIdFlow.collect { id ->
                 if (_activeCameraEngine.value == "camera2") _currentCameraId.value = id
+            }
+        }
+        viewModelScope.launch {
+            ptpCameraManager.currentCameraIdFlow.collect { id ->
+                if (_activeCameraEngine.value == "ptp") _currentCameraId.value = id
             }
         }
     }
@@ -301,15 +310,18 @@ class OperatorViewModel(application: Application) : AndroidViewModel(application
     private var cameraTypeCollector: Job? = null
     private var camera2ConnectedCollector: Job? = null
     private var camera2TypeCollector: Job? = null
+    private var ptpConnectedCollector: Job? = null
+    private var ptpTypeCollector: Job? = null
 
     /**
-     * Initialize BOTH camera systems:
+     * Initialize ALL THREE camera systems:
      * - UVCCamera for USB capture cards (MacroSilicon, etc.) — DO NOT MODIFY
      * - Camera2 for built-in phone cameras (front/back)
+     * - PTPCameraManager for direct DSLR control over USB
      */
     fun initCamera() {
         Log.i(TAG, "═══════════════════════════════════════════════════")
-        Log.i(TAG, "initCamera: Dual engine — UVC + Camera2")
+        Log.i(TAG, "initCamera: Triple engine — UVC + Camera2 + PTP")
         Log.i(TAG, "═══════════════════════════════════════════════════")
 
         // Initialize UVC camera system (USB capture cards) — UNCHANGED from v18
@@ -317,6 +329,9 @@ class OperatorViewModel(application: Application) : AndroidViewModel(application
 
         // Enumerate Camera2 built-in cameras (front/back)
         camera2Manager.enumerateCameras()
+
+        // Initialize the PTP engine (direct DSLR control over USB)
+        ptpCameraManager.initCamera()
 
         // Set up UVC collectors
         if (cameraConnectedCollector?.isActive != true) {
@@ -366,17 +381,50 @@ class OperatorViewModel(application: Application) : AndroidViewModel(application
             }
         }
 
+        // Set up PTP collectors
+        if (ptpConnectedCollector?.isActive != true) {
+            ptpConnectedCollector?.cancel()
+            ptpConnectedCollector = viewModelScope.launch {
+                ptpCameraManager.isConnected.collect { connected ->
+                    if (_activeCameraEngine.value == "ptp") {
+                        _cameraConnected.value = connected
+                    }
+                    updateCameraSource()
+                    refreshAvailableCameras()
+                }
+            }
+        }
+
+        if (ptpTypeCollector?.isActive != true) {
+            ptpTypeCollector?.cancel()
+            ptpTypeCollector = viewModelScope.launch {
+                ptpCameraManager.cameraType.collect {
+                    updateCameraSource()
+                    refreshAvailableCameras()
+                }
+            }
+        }
+
         // Build initial merged camera list
         refreshAvailableCameras()
 
-        Log.i(TAG, "Camera initialized — UVC + Camera2, cameraSource=${_cameraSource.value}")
+        Log.i(TAG, "Camera initialized — UVC + Camera2 + PTP, cameraSource=${_cameraSource.value}")
     }
 
     private fun updateCameraSource() {
+        val ptpConnected = ptpCameraManager.isConnected.value
         val uvcConnected = cameraUVCManager.isConnected.value
         val cameraType = cameraUVCManager.cameraType.value
         val isUSB = cameraUVCManager.isUSBCamera.value
         val c2Connected = camera2Manager.isConnected.value
+
+        // If a PTP camera (DSLR) is connected, it takes priority
+        if (ptpConnected) {
+            _activeCameraEngine.value = "ptp"
+            _cameraConnected.value = true
+            _cameraSource.value = "ptp"
+            return
+        }
 
         // If UVC is connected, it takes priority
         if (uvcConnected) {
@@ -394,23 +442,31 @@ class OperatorViewModel(application: Application) : AndroidViewModel(application
             return
         }
 
-        // Nothing connected yet — but Camera2 may connect later
-        if (_activeCameraEngine.value == "camera2") {
-            _cameraConnected.value = c2Connected
-            _cameraSource.value = if (c2Connected) "builtin" else "none"
-        } else {
-            _cameraConnected.value = uvcConnected
-            _cameraSource.value = if (uvcConnected) "uvc" else "none"
+        // Nothing connected yet — keep whatever engine was last chosen
+        when (_activeCameraEngine.value) {
+            "camera2" -> {
+                _cameraConnected.value = c2Connected
+                _cameraSource.value = if (c2Connected) "builtin" else "none"
+            }
+            "ptp" -> {
+                _cameraConnected.value = ptpConnected
+                _cameraSource.value = if (ptpConnected) "ptp" else "none"
+            }
+            else -> {
+                _cameraConnected.value = uvcConnected
+                _cameraSource.value = if (uvcConnected) "uvc" else "none"
+            }
         }
     }
 
     /**
-     * Refresh the merged available cameras list from both engines.
+     * Refresh the merged available cameras list from all engines (PTP + UVC + Camera2).
      */
     private fun refreshAvailableCameras() {
+        val ptpList = ptpCameraManager.availableCameras.value
         val uvcList = cameraUVCManager.availableCameras.value
         val c2List = camera2Manager.availableCameras.value
-        _allAvailableCameras.value = uvcList + c2List
+        _allAvailableCameras.value = ptpList + uvcList + c2List
     }
 
     fun switchCamera() {
@@ -427,12 +483,29 @@ class OperatorViewModel(application: Application) : AndroidViewModel(application
 
     fun getAvailableCameras(): List<Pair<String, String>> {
         cameraUVCManager.refreshCameraList()
+        ptpCameraManager.refreshCameraList()
         camera2Manager.enumerateCameras()
         refreshAvailableCameras()
         return _allAvailableCameras.value
     }
 
     fun switchToCameraById(cameraId: String) {
+        // PTP camera (ID starts with "ptp:")
+        if (cameraId.startsWith("ptp:")) {
+            Log.i(TAG, "switchToCameraById: Switching to PTP camera $cameraId")
+            _activeCameraEngine.value = "ptp"
+            _currentCameraId.value = cameraId
+
+            // Stop the other engines
+            try { camera2Manager.closeCamera() } catch (_: Exception) {}
+            try { cameraUVCManager.hidePreview() } catch (_: Exception) {}
+
+            ptpCameraManager.switchCamera(cameraId)
+            _cameraConnected.value = true
+            _cameraSource.value = "ptp"
+            return
+        }
+
         // Check if this is a Camera2 camera (ID is numeric 0, 1, etc.)
         val c2Cameras = camera2Manager.availableCameras.value
         val isCamera2 = c2Cameras.any { it.first == cameraId }
@@ -467,6 +540,7 @@ class OperatorViewModel(application: Application) : AndroidViewModel(application
     fun forceRescanUsbCamera() {
         Log.i(TAG, "forceRescanUsbCamera: User requested USB camera rescan")
         cameraUVCManager.forceRescan()
+        ptpCameraManager.forceRescan()
     }
 
     fun setUvcDeviceAttached(attached: Boolean) {
@@ -541,10 +615,10 @@ class OperatorViewModel(application: Application) : AndroidViewModel(application
             }
         }
 
-        if (_activeCameraEngine.value == "camera2") {
-            camera2Manager.capturePhoto(captureCallback)
-        } else {
-            cameraUVCManager.capturePhoto(captureCallback)
+        when (_activeCameraEngine.value) {
+            "camera2" -> camera2Manager.capturePhoto(captureCallback)
+            "ptp" -> ptpCameraManager.capturePhoto(captureCallback)
+            else -> cameraUVCManager.capturePhoto(captureCallback)
         }
     }
 
@@ -1261,8 +1335,11 @@ class OperatorViewModel(application: Application) : AndroidViewModel(application
         cameraTypeCollector?.cancel()
         camera2ConnectedCollector?.cancel()
         camera2TypeCollector?.cancel()
+        ptpConnectedCollector?.cancel()
+        ptpTypeCollector?.cancel()
         socketManager.destroy()
         cameraUVCManager.destroy()
         camera2Manager.destroy()
+        ptpCameraManager.destroy()
     }
 }
