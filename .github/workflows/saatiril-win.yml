@@ -23,7 +23,7 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 60
     steps:
-      - name: Checkout source (Saatiril-Andro)
+      - name: Checkout source (Saatiril-PTP)
         uses: actions/checkout@v4
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -141,7 +141,7 @@ jobs:
           else
             echo "=== Release 'latest' does NOT exist — creating ==="
             gh release create latest "dist-electron/${ASSET_NAME}" \
-              --title "Saatiril Andro - Latest" \
+              --title "Saatiril PTP - Latest" \
               --notes "Build #${{ github.run_number }}" \
               --prerelease --repo "$REPO"
           fi

@@ -124,7 +124,7 @@ jobs:
           else
             echo "Creating 'latest' release with MC APKs"
             gh release create latest saatiril-mc.apk saatiril-mc-debug.apk \
-              --title "Saatiril Andro - Latest Build" \
+              --title "Saatiril PTP - Latest Build" \
               --notes "MC-Only APK (BLE Remote) - Build #${{ github.run_number }}" \
               --prerelease
           fi

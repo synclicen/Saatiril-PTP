@@ -153,7 +153,7 @@ jobs:
           echo "Assets to publish: $ASSETS"
 
           gh release create latest \
-            --title "Saatiril Andro - Latest Build" \
+            --title "Saatiril PTP - Latest Build" \
             --notes "Auto-built APK from commit ${GITHUB_SHA::7}" \
             --prerelease --target main $ASSETS 2>/tmp/create.err || true
 

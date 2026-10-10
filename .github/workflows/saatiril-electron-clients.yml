@@ -95,7 +95,7 @@ jobs:
           npx electron-builder --win --x64 --config electron-clients/builder-operator.yml
           Remove-Item operator-main.js, preload.js, connection.html -ErrorAction SilentlyContinue
 
-      - name: Upload to Saatiril-Andro releases
+      - name: Upload to Saatiril-PTP releases
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -138,7 +138,7 @@ jobs:
           # Ensure the 'latest' release exists; create if missing.
           if ! gh release view latest --repo "$REPO" >/dev/null 2>&1; then
             echo "=== Release 'latest' missing — creating empty release ==="
-            gh release create latest --title "Saatiril Andro - Latest" \
+            gh release create latest --title "Saatiril PTP - Latest" \
               --notes "Build #${{ github.run_number }}" \
               --prerelease --repo "$REPO"
           fi
