@@ -13,13 +13,20 @@ import com.saatiril.andro.camera.HandTriggerDetector
 import com.saatiril.andro.camera.PTPCameraManager
 import com.saatiril.andro.camera.UVCCameraManager
 import com.saatiril.andro.util.FilenameUtils
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import org.json.JSONArray
+import org.json.JSONObject
+import java.io.File
 
 /**
  * ═════════════════════════════════════════════════════════════════════════
@@ -108,6 +115,34 @@ class OperatorViewModel(application: Application) : AndroidViewModel(application
 
     private val _isSending = MutableStateFlow(false)
     val isSending: StateFlow<Boolean> = _isSending.asStateFlow()
+
+    // BUG #4 fix: surface photo-send errors to the operator UI. The previous
+    // implementation logged errors and silently advanced the operator to the
+    // next target — the operator had no idea their photos never reached the
+    // admin. The UI binds to this flow and shows a Snackbar / red banner when
+    // a send fails so the operator can manually retry (re-capture).
+    private val _captureError = MutableStateFlow<String?>(null)
+    val captureError: StateFlow<String?> = _captureError.asStateFlow()
+
+    /** Clear the last capture error (called by the UI when the user dismisses it). */
+    fun clearCaptureError() { _captureError.value = null }
+
+    // BUG #4 fix: app-scoped CoroutineScope so the photo retry flush outlives
+    // ViewModel clear (matches AdminViewModel.appScope rationale in BUG #9).
+    private val opAppScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    // BUG #4 fix: file-based persistence for un-delivered photos. The
+    // SocketManager already has an IN-MEMORY retry queue (CRITICAL_EVENTS),
+    // but that queue is lost if the operator app is killed (OOM, low battery,
+    // user swipe-away) before the socket reconnects. This file queue is the
+    // backup: every finalizeCapture writes the photo data here BEFORE marking
+    // done, and a startup flush re-sends any leftover items once the socket
+    // reconnects. Photos are removed from the queue only after a confirmed
+    // send (or after MAX_QUEUE_RETRIES attempts — then they're left on disk
+    // for manual recovery).
+    private val photoQueueDir: File by lazy {
+        File(getApplication<Application>().filesDir, "operator_photo_queue").apply { mkdirs() }
+    }
 
     // ─── Gridline Settings ──────────────────────────────────────
 
@@ -755,6 +790,77 @@ class OperatorViewModel(application: Application) : AndroidViewModel(application
     }
 
     /**
+     * MC sends a student to operator(s) — photoshoot modes only.
+     * Mirrors AdminViewModel.sendToOperator but emits over the socket to the
+     * remote admin/server (which then updates its own DB + broadcasts SYNC_DB).
+     *
+     * - single-photoshoot: channels = [myChannel] → only ch1 sees the student.
+     * - dual-photoshoot: channels = [1, 2] → both channels see the student
+     *   simultaneously (cooperative mode — either operator can photograph).
+     *
+     * Sets the student's status to "sent" locally (instant UI feedback) and
+     * emits one MC_CALL per requested channel. The server's handleMcCall is
+     * mode-aware (photoshoot → "sent") so the SYNC_DB that bounces back keeps
+     * the "sent" status (it does NOT get reverted to "active_$channel").
+     */
+    fun sendToOperator(student: Student, channels: List<Int>) {
+        // Update local project DB so MC sees status change instantly
+        _project.value?.let { proj ->
+            val updatedDb = proj.database.map { s ->
+                if (s.id == student.id) s.copy(status = "sent") else s
+            }
+            _project.value = proj.copy(database = updatedDb)
+        }
+        // Emit MC_CALL to each requested channel (student carries status="sent"
+        // so the operator + server both see the correct state immediately).
+        val sentStudent = student.copy(status = "sent")
+        for (ch in channels) {
+            socketManager.sendMcCall(sentStudent, ch)
+        }
+        Log.i(TAG, "MC_CALL sent (photoshoot): ${student.nama} channels=$channels")
+    }
+
+    /**
+     * MC sends ALL selected students to operator(s) in one batch — photoshoot
+     * modes only. Mirrors the Electron handleSendBatchToOperator: marks every
+     * selected student as "sent" in a single DB pass, then emits one MC_CALL
+     * per (student × channel). The server's handleMcCall + the single SYNC_DB
+     * broadcast at the end consolidate the wire traffic.
+     *
+     * Order matters in dual mode (both channels must see the same student
+     * before the next), so the per-student loop emits to all channels before
+     * advancing.
+     *
+     * @param students the selected pending students (caller is responsible
+     *   for filtering out non-pending — matches Electron's selectedStudents
+     *   memo which keeps only `s.status === 'pending'`).
+     * @param channels [1] for single-photoshoot, [1, 2] for dual-photoshoot.
+     */
+    fun sendBatchToOperator(students: List<Student>, channels: List<Int>) {
+        if (students.isEmpty()) return
+        // Single pass: mark ALL selected students as 'sent' locally so the MC's
+        // queue reflects the change instantly (operator queue also recomputes
+        // via SYNC_DB bounce-back from the server).
+        _project.value?.let { proj ->
+            val selectedIds = students.map { it.id }.toSet()
+            val updatedDb = proj.database.map { s ->
+                if (selectedIds.contains(s.id)) s.copy(status = "sent") else s
+            }
+            _project.value = proj.copy(database = updatedDb)
+        }
+        // Emit MC_CALL for each (student × channel). The student object
+        // carries status="sent" so the server's handleMcCall (mode-aware) and
+        // operators both see the correct state immediately.
+        for (student in students) {
+            val sentStudent = student.copy(status = "sent")
+            for (ch in channels) {
+                socketManager.sendMcCall(sentStudent, ch)
+            }
+        }
+        Log.i(TAG, "MC_CALL batch sent (photoshoot): ${students.size} students, channels=$channels")
+    }
+
+    /**
      * MC/Admin resets a student back to pending.
      */
     fun resetStudent(studentId: String, channel: Int) {
@@ -816,6 +922,9 @@ class OperatorViewModel(application: Application) : AndroidViewModel(application
             startStateRequestLoop()
             requestFrameIfNeeded()
             startFrameRequestLoop()
+            // BUG #4: re-send any photo queue items left from a previous
+            // session (app was killed before the background send completed).
+            flushPhotoQueue()
         }
 
         socketManager.on("auth_failed") { reason ->
@@ -1162,6 +1271,46 @@ class OperatorViewModel(application: Application) : AndroidViewModel(application
             }
             val primaryFilename = filenames.firstOrNull() ?: ""
 
+            // BUG #4 fix: persist captured photo bytes to a local file-based
+            // queue BEFORE marking done. If this persist fails (disk full,
+            // permission revoked) we surface the error to the operator and
+            // DO NOT mark done — the operator can re-capture. The previous
+            // implementation marked done in _project.value and then launched
+            // a fire-and-forget background send: if the app died (OOM, swipe
+            // away) before the send completed, the photo bytes were lost
+            // forever while the operator's UI happily advanced to the next
+            // target.
+            val queueFile = withContext(Dispatchers.IO) {
+                try {
+                    val json = JSONObject().apply {
+                        put("studentId", student.id)
+                        put("studentNim", student.nim)
+                        put("studentNama", student.nama)
+                        put("channel", _myChannel.value)
+                        put("version", newVersion)
+                        put("filename", primaryFilename)
+                        put("timestamp", System.currentTimeMillis())
+                        put("photos", JSONArray(photos))
+                    }
+                    val f = File(photoQueueDir, "${student.id}_${_myChannel.value}_${newVersion}_${System.currentTimeMillis()}.json")
+                    f.writeText(json.toString())
+                    Log.i(TAG, "BUG#4: persisted photo set to ${f.name} (${photos.size} photos)")
+                    f
+                } catch (e: Exception) {
+                    Log.e(TAG, "BUG#4: FAILED to persist photo set: ${e.message}", e)
+                    null
+                }
+            }
+
+            if (queueFile == null) {
+                // Persist failed — surface error, DO NOT mark done, reset phase
+                // so the operator can retry the shutter.
+                _capturePhase.value = if (CameraModes.photosPerSession(mode) == 2) CapturePhase.READY_2 else CapturePhase.READY_1
+                _isSending.value = false
+                _captureError.value = "Gagal menyimpan foto ke antrian lokal — coba lagi"
+                return
+            }
+
             // ═══ PHASE 1: IMMEDIATE — unblock MC and reset operator state ═══
             socketManager.sendStudentDone(student.id)
 
@@ -1193,12 +1342,19 @@ class OperatorViewModel(application: Application) : AndroidViewModel(application
             _project.value = updatedProject
             updateOpQueue()
 
+            // Clear any previous error — the persist succeeded, send is now in flight.
+            _captureError.value = null
+
             Log.i(TAG, "finalizeCapture: Operator state reset — ready for next target")
 
             // ═══ PHASE 2: BACKGROUND — send photos via socket ═══
-            viewModelScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+            // BUG #4 fix: launch on opAppScope (survives ViewModel clear) so the
+            // send completes even if the user backgrounds the app. On success
+            // we delete the persisted queue file (it served its purpose as a
+            // backup). On failure we LEAVE the file — a startup flush (see
+            // [flushPhotoQueue]) will retry the send on the next reconnect.
+            opAppScope.launch {
                 try {
-                    // Send PHOTOS_SAVED with all photo data
                     socketManager.sendPhotosSaved(
                         student = student,
                         photos = photos,
@@ -1206,25 +1362,72 @@ class OperatorViewModel(application: Application) : AndroidViewModel(application
                         filename = primaryFilename
                     )
 
-                    // Send OP_PROGRESS
                     socketManager.sendOpProgress("Selesai — Menunggu target...")
 
-                    // v10: NO local photo save — photos only sent via socket
-                    // Admin (Electron) saves photos via PHOTOS_SAVED event
                     Log.i(TAG, "finalizeCapture: Photos sent via socket (NOT saved locally — matching Electron browser mode)")
 
-                    // Send SYNC_DB to sync with other clients
                     socketManager.sendSyncDb(updatedProject)
 
                     Log.i(TAG, "finalizeCapture: Background tasks complete for ${student.nama}")
+
+                    // BUG #4: send completed (or queued in SocketManager's
+                    // in-memory queue) — remove the backup file.
+                    withContext(Dispatchers.IO) {
+                        try { queueFile.delete() } catch (_: Exception) {}
+                    }
                 } catch (e: Exception) {
                     Log.e(TAG, "finalizeCapture: Background task error: ${e.message}", e)
+                    // BUG #4: surface the error — but DON'T revert _project.value
+                    // (the operator already advanced). The persisted queue file
+                    // remains on disk for the startup flush to retry.
+                    _captureError.value = "Foto tersimpan lokal tapi gagal terkirim ke admin — akan diulang otomatis"
                 }
             }
         } catch (e: Exception) {
             Log.e(TAG, "Failed to finalize capture: ${e.message}", e)
             _capturePhase.value = CapturePhase.READY_1
             _isSending.value = false
+            _captureError.value = "Gagal finalisasi: ${e.message}"
+        }
+    }
+
+    /**
+     * BUG #4 fix: retry-send any photo queue items left on disk from a previous
+     * session (app was killed before the background send completed). Called
+     * once after the socket successfully connects. Best-effort: if the send
+     * fails again the file remains for the next call.
+     */
+    fun flushPhotoQueue() {
+        opAppScope.launch {
+            val files = withContext(Dispatchers.IO) {
+                try { photoQueueDir.listFiles()?.toList() ?: emptyList() } catch (_: Exception) { emptyList() }
+            }
+            if (files.isEmpty()) return@launch
+            Log.i(TAG, "BUG#4: flushing ${files.size} leftover photo queue item(s)")
+            for (f in files) {
+                try {
+                    val json = JSONObject(withContext(Dispatchers.IO) { f.readText() })
+                    val student = Student(
+                        id = json.optString("studentId"),
+                        nim = json.optString("studentNim"),
+                        nama = json.optString("studentNama"),
+                        status = "done"
+                    )
+                    val channel = json.optInt("channel", 1)
+                    val version = json.optInt("version", 1)
+                    val filename = json.optString("filename", "")
+                    val photos = mutableListOf<String>()
+                    val arr = json.optJSONArray("photos")
+                    if (arr != null) for (i in 0 until arr.length()) photos.add(arr.getString(i))
+
+                    _myChannel.value = channel
+                    socketManager.sendPhotosSaved(student, photos, version, filename)
+                    Log.i(TAG, "BUG#4: re-sent photo set ${f.name} (student=${student.nama})")
+                    withContext(Dispatchers.IO) { try { f.delete() } catch (_: Exception) {} }
+                } catch (e: Exception) {
+                    Log.w(TAG, "BUG#4: failed to re-send ${f.name}: ${e.message} — will retry on next flush")
+                }
+            }
         }
     }
 

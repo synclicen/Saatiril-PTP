@@ -261,15 +261,27 @@ class CeremonyModeVpnService : VpnService() {
         super.onDestroy()
         Log.i(TAG, "CeremonyModeVpnService destroying — stopping VPN")
 
-        workerThread?.interrupt()
-        workerThread = null
-
+        // BUG #12 fix: close vpnInterface FIRST so the worker thread's
+        // `input.read(buffer)` unblocks (the underlying FD is closed → read
+        // throws IOException → the catch clause lets the thread exit). Only
+        // AFTER that do we interrupt() the thread. The previous order
+        // (interrupt first, close second) was racy: interrupt() does NOT
+        // unblock a FileInputStream.read() on Android — the thread keeps
+        // waiting on the FD forever, leaking the worker + preventing the
+        // service from fully releasing the TUN interface. The user-visible
+        // symptom was "Mode Prosesi toggle stuck ON" after toggling it off.
         try {
             vpnInterface?.close()
         } catch (e: Exception) {
             Log.w(TAG, "Error closing VPN interface: ${e.message}")
         }
         vpnInterface = null
+
+        // Now interrupt as a belt-and-suspenders — by this point the FD is
+        // closed and the worker should already be exiting its read loop.
+        workerThread?.interrupt()
+        try { workerThread?.join(500) } catch (_: InterruptedException) {}
+        workerThread = null
     }
 
     override fun onRevoke() {

@@ -11,6 +11,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.snapshots.SnapshotStateList
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -102,6 +103,87 @@ fun MCPanelScreen(
     val done = channelStudents.filter { it.status == "done" }
     val hasActive = active.isNotEmpty()
     val nextPending = if (!isPhotoshoot) channelStudents.firstOrNull { it.status == "pending" } else null
+
+    // ── Photoshoot multi-select state ───────────────────────────────
+    // SnapshotStateList so Compose recomposes whenever selection changes.
+    // Order is preserved (matches Electron's selectedStudentIds string[]):
+    // the batch send emits MC_CALLs in selection order, matching the operator
+    // queue display.
+    var searchQuery by remember { mutableStateOf("") }
+    val selectedIds: SnapshotStateList<String> = remember { mutableStateListOf() }
+
+    // The displayed queue in photoshoot mode — respects the search filter.
+    // In photoshoot mode, ALL students are shown (no channel filter), but
+    // we filter by search query (matches the Electron mc-panel's
+    // displayedAntrean logic).
+    val displayedAntrean: List<Student> = if (isPhotoshoot) {
+        val q = searchQuery.trim().lowercase()
+        if (q.isEmpty()) channelStudents
+        else channelStudents.filter {
+            it.nama.lowercase().contains(q) || it.nim.lowercase().contains(q)
+        }
+    } else {
+        channelStudents
+    }
+
+    // Resolve the selected IDs to actual Student objects (filtering out any
+    // that are no longer 'pending' — e.g. already sent in a previous batch).
+    // Matches Electron's selectedStudents memo: `if (s && s.status === 'pending')`.
+    val selectedStudents: List<Student> = if (isPhotoshoot) {
+        // Look up by ID in the live DB so status changes (e.g. 'sent' after a
+        // previous batch) are reflected — a selected student that is no longer
+        // pending is silently dropped from the send batch.
+        selectedIds.mapNotNull { id ->
+            db.firstOrNull { it.id == id }?.takeIf { it.status == "pending" }
+        }
+    } else {
+        emptyList()
+    }
+
+    // ── Photoshoot multi-select helpers ─────────────────────────────
+    fun toggleStudentSelection(id: String) {
+        val idx = selectedIds.indexOf(id)
+        if (idx >= 0) selectedIds.removeAt(idx) else selectedIds.add(id)
+    }
+
+    // Select all currently-displayed pending students (respects the search
+    // filter — if MC filtered to e.g. "toga", only those get selected).
+    // Accumulates onto existing selection (matches Electron selectAllDisplayed).
+    fun selectAllDisplayed() {
+        val seen = selectedIds.toHashSet()
+        for (s in displayedAntrean) {
+            if (s.status == "pending" && !seen.contains(s.id)) {
+                selectedIds.add(s.id)
+                seen.add(s.id)
+            }
+        }
+    }
+
+    // Deselect all currently-displayed (respects search filter — only removes
+    // the ones currently visible so MC can prune part of a big selection).
+    fun deselectAllDisplayed() {
+        val displayedIdSet = displayedAntrean.map { it.id }.toHashSet()
+        selectedIds.removeAll(displayedIdSet)
+    }
+
+    fun clearSelection() {
+        selectedIds.clear()
+    }
+
+    // Batch send — for each selected student: mark 'sent' + emit MC_CALL
+    // (to both channels in dual mode, to channel 1 only in single mode).
+    // The OperatorViewModel.sendBatchToOperator handles the local DB update +
+    // per-(student × channel) MC_CALL emit. The server's handleMcCall is
+    // mode-aware so it won't revert "sent" back to "active_$channel".
+    // Clear selection at the end + reset search query so the MC can see the
+    // full queue again (the just-sent students are now 'sent', filtered out).
+    fun handleSendBatchToOperator() {
+        if (selectedStudents.isEmpty()) return
+        val channels = if (isDual) listOf(1, 2) else listOf(1)
+        opViewModel.sendBatchToOperator(selectedStudents, channels)
+        searchQuery = ""
+        clearSelection()
+    }
 
     // Auto-scroll to active student position — bring to TOP of visible area
     val activeStudentId = active.firstOrNull()?.id
@@ -271,31 +353,324 @@ fun MCPanelScreen(
                 }
             }
         } else {
-            // Photoshoot mode — MC just sees stats (no PANGGIL)
+            // Photoshoot mode — stat card + multi-select toolbar.
+            // Mirrors the Electron mc-panel's photoshoot branch: MC doesn't
+            // "call" students to the stage (operator picks from the queue),
+            // instead MC SELECTS one or more pending students + sends them to
+            // the operator queue in one batch via handleSendBatchToOperator.
             Card(modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp), colors = CardDefaults.cardColors(containerColor = PANEL), shape = RoundedCornerShape(10.dp)) {
                 Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                     Text("Mode Photoshoot", style = TextStyle(color = GOLD, fontSize = 14.sp, fontWeight = FontWeight.Bold))
-                    Text("MC tidak memanggil — operator pilih dari daftar", style = TextStyle(color = MUTED, fontSize = 11.sp))
+                    Text("Pilih peserta → kirim ke operator", style = TextStyle(color = MUTED, fontSize = 11.sp))
                 }
+            }
+
+            // 4 stat pills (matches the non-photoshoot branch + Electron mc-panel).
+            Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                val pills = listOf(
+                    Triple("ANTREAN", pending.size, MUTED),
+                    Triple("TERKIRIM", channelStudents.count { it.status == "sent" }, CYAN),
+                    Triple("SELESAI", done.size, GREEN),
+                    Triple("TOTAL", channelStudents.size, GOLD)
+                )
+                pills.forEach { (label, count, color) ->
+                    Card(modifier = Modifier.weight(1f).clip(RoundedCornerShape(4.dp)),
+                        colors = CardDefaults.cardColors(containerColor = color.copy(alpha = 0.15f)),
+                        shape = RoundedCornerShape(4.dp),
+                        border = androidx.compose.foundation.BorderStroke(1.dp, color.copy(alpha = 0.3f))) {
+                        Column(Modifier.padding(vertical = 2.dp, horizontal = 4.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                            Text("$count", style = TextStyle(color = color, fontSize = 12.sp, fontWeight = FontWeight.Bold))
+                            Text(label, style = TextStyle(color = color.copy(alpha = 0.7f), fontSize = 7.sp, fontWeight = FontWeight.Bold))
+                        }
+                    }
+                }
+            }
+
+            // ── Search input ── (matches Electron mc-panel's search input)
+            OutlinedTextField(
+                value = searchQuery,
+                onValueChange = { searchQuery = it },
+                placeholder = { Text("Cari NIM atau Nama...", style = TextStyle(color = MUTED.copy(alpha = 0.5f), fontSize = 11.sp)) },
+                leadingIcon = { Icon(Icons.Default.Search, contentDescription = null, modifier = Modifier.size(14.dp), tint = MUTED) },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 2.dp),
+                shape = RoundedCornerShape(8.dp),
+                colors = OutlinedTextFieldDefaults.colors(
+                    focusedTextColor = Color.White,
+                    unfocusedTextColor = Color.White,
+                    focusedBorderColor = GREEN,
+                    unfocusedBorderColor = BORDER,
+                    cursorColor = GREEN,
+                    focusedLeadingIconColor = GREEN,
+                    unfocusedLeadingIconColor = MUTED
+                ),
+                textStyle = TextStyle(color = Color.White, fontSize = 11.sp)
+            )
+
+            // ── Multi-select toolbar (photoshoot only) ──
+            // Pilih Semua / Kosongkan / counter — matches Electron mc-panel
+            // toolbar between the search input and the list.
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 2.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                // Pilih Semua — selects all currently-displayed pending students.
+                // Disabled when no displayed pending students.
+                val hasDisplayedPending = displayedAntrean.any { it.status == "pending" }
+                OutlinedButton(
+                    onClick = { selectAllDisplayed() },
+                    enabled = hasDisplayedPending,
+                    modifier = Modifier.weight(1f),
+                    shape = RoundedCornerShape(6.dp),
+                    colors = ButtonDefaults.outlinedButtonColors(
+                        contentColor = GREEN,
+                        disabledContentColor = MUTED.copy(alpha = 0.4f)
+                    ),
+                    border = androidx.compose.foundation.BorderStroke(1.dp, if (hasDisplayedPending) GREEN.copy(alpha = 0.5f) else BORDER.copy(alpha = 0.4f)),
+                    contentPadding = PaddingValues(horizontal = 6.dp, vertical = 2.dp)
+                ) {
+                    Icon(Icons.Default.CheckCircle, contentDescription = null, modifier = Modifier.size(12.dp))
+                    Spacer(Modifier.width(4.dp))
+                    Text("Pilih Semua", fontSize = 9.sp, fontWeight = FontWeight.SemiBold)
+                }
+                // Kosongkan — deselects all currently-displayed (respects
+                // search filter — only removes the visible ones). Disabled when
+                // the selection is empty.
+                OutlinedButton(
+                    onClick = { deselectAllDisplayed() },
+                    enabled = selectedIds.isNotEmpty(),
+                    modifier = Modifier.weight(1f),
+                    shape = RoundedCornerShape(6.dp),
+                    colors = ButtonDefaults.outlinedButtonColors(
+                        contentColor = MUTED,
+                        disabledContentColor = MUTED.copy(alpha = 0.4f)
+                    ),
+                    border = androidx.compose.foundation.BorderStroke(1.dp, if (selectedIds.isNotEmpty()) MUTED.copy(alpha = 0.5f) else BORDER.copy(alpha = 0.4f)),
+                    contentPadding = PaddingValues(horizontal = 6.dp, vertical = 2.dp)
+                ) {
+                    Icon(Icons.Default.Cancel, contentDescription = null, modifier = Modifier.size(12.dp))
+                    Spacer(Modifier.width(4.dp))
+                    Text("Kosongkan", fontSize = 9.sp, fontWeight = FontWeight.SemiBold)
+                }
+                // Counter — X terpilih
+                Text(
+                    "${selectedIds.size} terpilih",
+                    style = TextStyle(
+                        color = if (selectedIds.isNotEmpty()) GREEN else MUTED.copy(alpha = 0.6f),
+                        fontSize = 9.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                )
             }
         }
 
         Spacer(Modifier.height(6.dp))
 
         // ── Queue list ──
+        // Photoshoot: clickable rows + selected indicator (toggle on click).
+        // Non-photoshoot: original behavior (first-pending highlight, no click).
         Column(
-            modifier = Modifier.fillMaxSize().verticalScroll(scrollState).padding(horizontal = 8.dp),
+            modifier = Modifier.weight(1f).verticalScroll(scrollState).padding(horizontal = 8.dp),
             verticalArrangement = Arrangement.spacedBy(2.dp)
         ) {
-            Text("Antrean Ch.$myChannel (${pending.size} menunggu)", style = TextStyle(color = MUTED, fontWeight = FontWeight.Bold, fontSize = 11.sp))
-            if (queueFilter.isEmpty()) {
-                Text("Antrean habis", Modifier.padding(8.dp), style = TextStyle(color = MUTED, fontSize = 12.sp))
+            if (isPhotoshoot) {
+                Text(
+                    "Antrean (${pending.size} menunggu${if (searchQuery.isNotBlank()) ", ${displayedAntrean.size} ditampilkan" else ""})",
+                    style = TextStyle(color = MUTED, fontWeight = FontWeight.Bold, fontSize = 11.sp)
+                )
+                if (displayedAntrean.isEmpty()) {
+                    Text(
+                        if (channelStudents.isEmpty()) "Antrean kosong" else "Tidak ditemukan",
+                        Modifier.padding(8.dp),
+                        style = TextStyle(color = MUTED, fontSize = 12.sp)
+                    )
+                } else {
+                    displayedAntrean.forEachIndexed { idx, s ->
+                        MCPhotoshootQueueRow(
+                            number = idx + 1,
+                            student = s,
+                            isSelected = selectedIds.contains(s.id),
+                            onToggle = { toggleStudentSelection(s.id) }
+                        )
+                    }
+                }
             } else {
-                queueFilter.forEachIndexed { idx, s ->
-                    MCQueueRow(idx + 1, s, myChannel)
+                Text("Antrean Ch.$myChannel (${pending.size} menunggu)", style = TextStyle(color = MUTED, fontWeight = FontWeight.Bold, fontSize = 11.sp))
+                if (queueFilter.isEmpty()) {
+                    Text("Antrean habis", Modifier.padding(8.dp), style = TextStyle(color = MUTED, fontSize = 12.sp))
+                } else {
+                    queueFilter.forEachIndexed { idx, s ->
+                        MCQueueRow(idx + 1, s, myChannel)
+                    }
                 }
             }
             Spacer(Modifier.height(8.dp))
+        }
+
+        // ── Footer: SEND batch button (photoshoot only) ──
+        // Mirrors the Electron mc-panel footer: shows selected count + first 3
+        // names + "+N lainnya" preview, then the send button.
+        if (isPhotoshoot) {
+            Column(
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp),
+                verticalArrangement = Arrangement.spacedBy(4.dp)
+            ) {
+                // Selected students preview (photoshoot only — show count +
+                // first 3 names + "+N lainnya" when N > 3). Matches Electron
+                // mc-panel footer preview block.
+                if (selectedStudents.isNotEmpty()) {
+                    Card(
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = CardDefaults.cardColors(containerColor = GREEN.copy(alpha = 0.1f)),
+                        shape = RoundedCornerShape(6.dp),
+                        border = androidx.compose.foundation.BorderStroke(1.dp, GREEN.copy(alpha = 0.3f))
+                    ) {
+                        Column(Modifier.padding(horizontal = 8.dp, vertical = 4.dp), verticalArrangement = Arrangement.spacedBy(1.dp)) {
+                            Text(
+                                "${selectedStudents.size} Peserta Dipilih",
+                                style = TextStyle(
+                                    color = GREEN,
+                                    fontSize = 9.sp,
+                                    fontWeight = FontWeight.Bold
+                                )
+                            )
+                            selectedStudents.take(3).forEach { s ->
+                                Text(
+                                    s.nama.ifBlank { "(tanpa nama)" },
+                                    style = TextStyle(color = Color.White, fontSize = 10.sp, fontWeight = FontWeight.Bold),
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
+                            if (selectedStudents.size > 3) {
+                                Text(
+                                    "+${selectedStudents.size - 3} lainnya",
+                                    style = TextStyle(color = MUTED, fontSize = 9.sp, fontStyle = androidx.compose.ui.text.font.FontStyle.Italic)
+                                )
+                            }
+                        }
+                    }
+                }
+
+                // SEND button — shows the count, disabled when selection is
+                // empty. Mirrors Electron mc-panel renderCallButton():
+                //   selectedStudents.length > 0
+                //     ? (dualPhotoshoot ? "KIRIM ${N} KE 2 KAMERA" : "KIRIM ${N} KE OPERATOR")
+                //     : "PILIH PESERTA DULU"
+                val canSend = selectedStudents.isNotEmpty()
+                val btnBg = if (canSend) GREEN else PANEL
+                val btnFg = if (canSend) BG else MUTED
+                val btnBorder = if (canSend) GREEN else BORDER.copy(alpha = 0.4f)
+                Button(
+                    onClick = { handleSendBatchToOperator() },
+                    enabled = canSend,
+                    modifier = Modifier.fillMaxWidth().height(52.dp),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = btnBg,
+                        contentColor = btnFg,
+                        disabledContainerColor = btnBg,
+                        disabledContentColor = btnFg
+                    ),
+                    shape = RoundedCornerShape(10.dp),
+                    border = androidx.compose.foundation.BorderStroke(2.dp, btnBorder)
+                ) {
+                    Icon(Icons.Default.Send, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        if (canSend) {
+                            if (isDual) "KIRIM ${selectedStudents.size} KE 2 KAMERA"
+                            else "KIRIM ${selectedStudents.size} KE OPERATOR"
+                        } else {
+                            "PILIH PESERTA DULU"
+                        },
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.Black
+                    )
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Photoshoot queue row — clickable to toggle selection. Mirrors the Electron
+ * mc-panel row rendering: each row has a checkbox-style icon (CheckSquare when
+ * selected, Square when not); click toggles selection. Selected rows get an
+ * emerald background + emerald name color + bold.
+ */
+@Composable
+private fun MCPhotoshootQueueRow(
+    number: Int,
+    student: Student,
+    isSelected: Boolean,
+    onToggle: () -> Unit
+) {
+    val isDone = student.status == "done"
+    val isSent = student.status == "sent"
+    // Status color: done → green, sent → cyan (waiting for operator), pending
+    // → muted (ready to be selected + sent).
+    val statusColor = when {
+        isDone -> GREEN.copy(alpha = 0.5f)
+        isSent -> CYAN
+        else -> MUTED
+    }
+    val rowBg = when {
+        isSelected -> GREEN.copy(alpha = 0.18f)
+        isDone -> PANEL.copy(alpha = 0.3f)
+        isSent -> CYAN.copy(alpha = 0.08f)
+        else -> PANEL
+    }
+    val rowBorderWidth = if (isSelected) 1.5.dp else 1.dp
+    val rowBorderColor = when {
+        isSelected -> GREEN
+        else -> BORDER.copy(alpha = 0.2f)
+    }
+    Card(
+        colors = CardDefaults.cardColors(containerColor = rowBg),
+        shape = RoundedCornerShape(6.dp),
+        border = androidx.compose.foundation.BorderStroke(rowBorderWidth, rowBorderColor),
+        modifier = Modifier.fillMaxWidth().clickable { onToggle() }
+    ) {
+        Row(
+            Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            Text(
+                "$number",
+                style = TextStyle(color = MUTED.copy(alpha = 0.5f), fontSize = 11.sp, fontFamily = FontFamily.Monospace),
+                modifier = Modifier.width(16.dp)
+            )
+            Box(Modifier.size(6.dp).clip(RoundedCornerShape(3.dp)).background(statusColor))
+            // Name + NIM
+            Column(Modifier.weight(1f)) {
+                Text(
+                    student.nama.ifBlank { "(tanpa nama)" },
+                    style = TextStyle(
+                        color = if (isSelected) GREEN else if (isDone) MUTED.copy(alpha = 0.4f) else Color.White,
+                        fontSize = 12.sp,
+                        fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal
+                    ),
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                if (student.nim.isNotBlank() && student.nama.isNotBlank()) {
+                    Text(
+                        student.nim,
+                        style = TextStyle(color = MUTED.copy(alpha = 0.5f), fontSize = 8.sp, fontFamily = FontFamily.Monospace),
+                        maxLines = 1
+                    )
+                }
+            }
+            // Selection checkbox icon (matches Electron mc-panel:
+            // CheckSquare when selected, Square when not).
+            Icon(
+                imageVector = if (isSelected) Icons.Default.CheckBox else Icons.Default.CheckBoxOutlineBlank,
+                contentDescription = if (isSelected) "Hapus pilihan" else "Pilih",
+                modifier = Modifier.size(14.dp),
+                tint = if (isSelected) GREEN else MUTED.copy(alpha = 0.5f)
+            )
         }
     }
 }

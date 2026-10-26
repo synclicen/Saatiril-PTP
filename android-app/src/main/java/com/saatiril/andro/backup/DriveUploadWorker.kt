@@ -8,6 +8,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlin.coroutines.cancellation.CancellationException
 
 /**
  * Background worker that processes the Google Drive upload queue.
@@ -52,13 +53,28 @@ class DriveUploadWorker(private val context: Context) {
             Log.d(TAG, "Worker already running")
             return
         }
+        // ISSUE 1 fix: reset stuck UPLOADING items on start. If the app was
+        // killed while an item was UPLOADING, it would stay stuck forever
+        // (dequeue only returns PENDING). This recovers all stuck items.
+        driveBackupManager.resetStuckUploads()
         workerJob = scope.launch {
             Log.i(TAG, "Drive upload worker started")
             while (true) {
                 try {
+                    // BUG #6: don't gate on hasBackupFolder() — per-project
+                    // uploads (item.treeUri != null) work even when the global
+                    // folder is not configured. processNext() routes via
+                    // uploadItem() which dispatches to the right method.
                     if (!driveBackupManager.hasBackupFolder()) {
-                        // No backup folder configured — wait and check again
-                        delay(POLL_INTERVAL_MS * 2)
+                        // No global backup folder — but the queue may still
+                        // have per-project items. Process them; if the queue
+                        // is empty, sleep longer.
+                        val processed = driveBackupManager.processNext()
+                        if (!processed) {
+                            delay(POLL_INTERVAL_MS * 2)
+                        } else {
+                            delay(500)
+                        }
                         continue
                     }
 
@@ -71,6 +87,16 @@ class DriveUploadWorker(private val context: Context) {
                         // Processed an item — short delay before next
                         delay(500)
                     }
+                } catch (e: CancellationException) {
+                    // BUG #10 fix: rethrow CancellationException BEFORE the
+                    // generic catch. The generic catch below swallowed it,
+                    // which meant `workerJob.cancel()` (called from stop())
+                    // never actually cancelled the loop — the worker would
+                    // catch the cancellation, sleep ERROR_BACKOFF_MS, and
+                    // resume, busy-looping forever. Rethrowing lets the
+                    // coroutine machinery properly terminate the job.
+                    Log.i(TAG, "Worker cancelled — exiting loop")
+                    throw e
                 } catch (e: Exception) {
                     Log.e(TAG, "Worker error: ${e.message}", e)
                     delay(ERROR_BACKOFF_MS)

@@ -233,7 +233,14 @@ async function sha256(text) {
 var VERSION = 'v24-client-sync-fix';
 var params = new URLSearchParams(window.location.search);
 var channel = parseInt(params.get('channel') || '1');
-var password = params.get('password') || '';
+// BUG #9 fix (audit Remote/Mirror batch 2): session password is NO LONGER
+// read from the URL query string. Passing ?password=... in a URL is insecure
+// — the password lands in browser history, server logs, referrer headers,
+// and any QR code that encodes it. Now we ALWAYS initialize empty + require
+// the password prompt (showPasswordPrompt) when the server demands a
+// session password (auth-requirement / auth-failed). The QR code generator
+// in admin-dashboard.tsx was also updated to drop the password param.
+var password = '';
 var socketPort = params.get('socketPort') || '3003';
 var socket = null;
 var authenticated = false;
@@ -242,7 +249,7 @@ var sessionPasswordHash = null;
 var searchQuery = '';
 var selectedStudent = null;
 
-console.log('[MC] Saatiril MC ' + VERSION + ' booting — channel=' + channel + ' socketPort=' + socketPort + ' hasPassword=' + (!!password));
+console.log('[MC] Saatiril MC ' + VERSION + ' booting — channel=' + channel + ' socketPort=' + socketPort);
 
 document.getElementById('ch-label').textContent = 'Ch.' + channel;
 document.getElementById('ver-label').textContent = VERSION;

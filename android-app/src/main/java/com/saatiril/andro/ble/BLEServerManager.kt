@@ -565,6 +565,12 @@ class BLEServerManager(private val context: Context) {
                 nextStudentChar?.value = value
                 // Notify any subscribed MC UI components
                 onNextStudentReceived?.invoke(jsonStr)
+                // BUG #7 fix: also push the new value to ALL subscribed MC
+                // clients (the admin-ble.html write only updated the local
+                // cache — connected MC remotes that were already subscribed
+                // never got the notification, so their queue/next-student
+                // display stayed stale until they manually re-read).
+                notifyCharacteristic(nextStudentChar, jsonStr)
             } else if (uuid == BLEProtocol.CHAR_QUEUE_DATA) {
                 // Admin-ble.html pushes queue data to MC
                 val jsonStr = String(value, StandardCharsets.UTF_8)
@@ -572,18 +578,25 @@ class BLEServerManager(private val context: Context) {
                 queueDataJson = jsonStr
                 queueDataChar?.value = value
                 onQueueDataReceived?.invoke(jsonStr)
+                // BUG #7 fix: notify subscribed MC clients (see CHAR_NEXT_STUDENT).
+                notifyCharacteristic(queueDataChar, jsonStr)
             } else if (uuid == BLEProtocol.CHAR_PROJECT_INFO) {
                 // Admin-ble.html pushes project info to MC
                 val jsonStr = String(value, StandardCharsets.UTF_8)
                 Log.i(TAG, "Project info received from admin: $jsonStr")
                 projectInfoJson = jsonStr
                 onProjectInfoReceived?.invoke(jsonStr)
+                // BUG #7: project_info has no NOTIFY property (READ+WRITE only,
+                // see startGattServer) so there is no characteristic to notify.
+                // MC clients read this once on connect — no live update needed.
             } else if (uuid == BLEProtocol.CHAR_STATUS) {
                 // Admin-ble.html pushes status update to MC
                 val jsonStr = String(value, StandardCharsets.UTF_8)
                 Log.i(TAG, "Status data received from admin: $jsonStr")
                 statusJson = jsonStr
                 statusChar?.value = value
+                // BUG #7 fix: notify subscribed MC clients (see CHAR_NEXT_STUDENT).
+                notifyCharacteristic(statusChar, jsonStr)
             }
 
             if (responseNeeded) {

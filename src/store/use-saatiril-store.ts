@@ -90,7 +90,15 @@ export type AppTab = 'admin' | 'mc' | 'operator'
 // The operator exe ALSO saves a local copy for redundancy.
 // NOTE: This caps ONLY the in-memory gallery for display. DISK SAVES are
 // triggered per-PHOTOS_SAVED and are UNLIMITED — safe for 4000+ participants.
-const MAX_PHOTO_HISTORY_IN_MEMORY = 200
+//
+// BUG #8 (audit-electron-side): raised from 200 → 500. At 200 the admin couldn't
+// scroll back to verify photos of students photographed earlier than the last
+// 200 in a 4000+ participant ceremony (the first ~3800 were invisible in the
+// gallery by the end). 500 entries × 2 photos × ~100KB ≈ 100MB — acceptable
+// for a ceremony laptop with 8GB+ RAM. Beyond the in-memory cap, the admin can
+// still verify via the file explorer on disk (disk saves are uncapped). After
+// an app restart, BUG #7's LazyThumbnail rehydrates the last 500 from disk.
+const MAX_PHOTO_HISTORY_IN_MEMORY = 500
 
 // ─── Frame storage: separate localStorage keys for frame base64 data ──────────
 // Frame data can be 500KB-2MB and must survive page reloads.
@@ -202,33 +210,59 @@ function getStatusPriority(status: StudentStatus): number {
  * Merge two student databases, keeping the "most advanced" status for each student.
  * This prevents data regression when SYNC_DB payloads from different channels
  * overwrite each other's progress in dual mode.
+ *
+ * BUG #20 (audit-electron-side): preserve LOCAL array order. Previously this
+ * used `Array.from(studentMap.values())` whose order is Map insertion order —
+ * local students first (in their original order), then any NEW incoming
+ * students appended in incoming order. That happens to BE the local order for
+ * existing students, BUT a Map's iteration order can be subtly disrupted if
+ * a key is `set()` again after initial insertion (the key keeps its ORIGINAL
+ * position — so re-setting existing students is fine). However, the audit
+ * flagged that the MC's `nextPending = channelStudents.find(s => s.status ===
+ * 'pending')` could pick a different student after a SYNC_DB merge if the
+ * array order changed. To make the order guarantee EXPLICIT + robust against
+ * any future Map-iteration changes, we now build the result by:
+ *   1. Iterating localDb IN ORDER (preserves Excel-import order).
+ *   2. Appending any NEW incoming students (not in localDb) in incoming order.
+ *   3. Applying the status merge (max-priority) per student.
+ * This guarantees the local array order never shifts due to a sync.
  */
 export function mergeDatabases(
   localDb: Student[],
   incomingDb: Student[],
 ): Student[] {
-  const studentMap = new Map<string, Student>()
-
-  // Add all local students
-  for (const s of localDb) {
-    studentMap.set(s.id, s)
-  }
-
-  // Merge incoming — only update if incoming status is more advanced
+  // Index incoming by id for O(1) lookup + dedupe.
+  const incomingById = new Map<string, Student>()
   for (const s of incomingDb) {
-    const existing = studentMap.get(s.id)
-    if (!existing) {
-      studentMap.set(s.id, s)
-    } else {
-      const existingPriority = getStatusPriority(existing.status)
-      const incomingPriority = getStatusPriority(s.status)
-      if (incomingPriority > existingPriority) {
-        studentMap.set(s.id, s)
-      }
+    const ex = incomingById.get(s.id)
+    if (!ex || getStatusPriority(s.status) > getStatusPriority(ex.status)) {
+      incomingById.set(s.id, s)
     }
   }
 
-  return Array.from(studentMap.values())
+  // First pass: walk localDb IN ORDER, merging in the incoming status if any.
+  const seenIds = new Set<string>()
+  const result: Student[] = []
+  for (const s of localDb) {
+    seenIds.add(s.id)
+    const inc = incomingById.get(s.id)
+    if (inc && getStatusPriority(inc.status) > getStatusPriority(s.status)) {
+      result.push(inc)
+    } else {
+      result.push(s)
+    }
+  }
+
+  // Second pass: append any incoming students NOT in localDb (new students
+  // added by another client since our last sync) in incoming order.
+  for (const s of incomingDb) {
+    if (!seenIds.has(s.id)) {
+      seenIds.add(s.id)
+      result.push(s)
+    }
+  }
+
+  return result
 }
 
 /**
@@ -351,6 +385,51 @@ export function mergeCaptureVersions(
 // ─── Debounced save ───────────────────────────────────────────────────────
 let saveTimeout: ReturnType<typeof setTimeout> | null = null
 const SAVE_DEBOUNCE_MS = 500 // Debounce saves to avoid thrashing localStorage
+
+// BUG #16 (audit-electron-side): opCapturedPhotosByChannel persistence.
+// Previously opCapturedPhotos lived ONLY in memory (Zustand state). If the
+// operator refreshed the page (F5, accidental, browser crash) mid-capture
+// (e.g. after photo 1 of 2 in wisuda mode), the in-progress photo was LOST.
+// The student's status was still 'active_N' in the DB (persisted), so the
+// operator could re-capture, but the first photo was gone. We now mirror the
+// per-channel photos array to sessionStorage (survives refresh, cleared on
+// tab close) so a mid-capture refresh restores the in-progress photos.
+// sessionStorage is sized for this (a few MB per tab) — fits 2 base64 photos.
+const OP_CAPTURED_PHOTOS_KEY = 'saatiril_op_captured_photos'
+
+function loadOpCapturedPhotosFromSession(): Record<number, string[]> {
+  try {
+    const raw = sessionStorage.getItem(OP_CAPTURED_PHOTOS_KEY)
+    if (!raw) return {}
+    const parsed = JSON.parse(raw)
+    if (parsed && typeof parsed === 'object') {
+      const result: Record<number, string[]> = {}
+      for (const [k, v] of Object.entries(parsed)) {
+        if (Array.isArray(v)) result[Number(k)] = (v as unknown[]).filter(x => typeof x === 'string') as string[]
+      }
+      return result
+    }
+  } catch (e) {
+    console.warn('[SAATIRIL] Failed to load opCapturedPhotos from sessionStorage:', e)
+  }
+  return {}
+}
+
+function saveOpCapturedPhotosToSession(photos: Record<number, string[]>) {
+  try {
+    // Only persist non-empty arrays to keep sessionStorage small + skip writes
+    // when nothing changed. (Clearing all → remove the key entirely.)
+    const hasData = Object.values(photos).some(arr => Array.isArray(arr) && arr.length > 0)
+    if (hasData) {
+      sessionStorage.setItem(OP_CAPTURED_PHOTOS_KEY, JSON.stringify(photos))
+    } else {
+      sessionStorage.removeItem(OP_CAPTURED_PHOTOS_KEY)
+    }
+  } catch (e) {
+    // sessionStorage quota exceeded (rare for 2 photos) — non-fatal.
+    console.warn('[SAATIRIL] Failed to save opCapturedPhotos to sessionStorage:', e)
+  }
+}
 
 interface SaatirilState {
   // Projects
@@ -498,7 +577,9 @@ export const useSaatirilStore = create<SaatirilState>((set, get) => ({
   currentScreen: 'hub',
   currentTab: 'admin',
   opCurrentTargets: {},
-  opCapturedPhotosByChannel: {},
+  // BUG #16: initialize from sessionStorage so a mid-capture refresh restores
+  // the in-progress photos (instead of starting from empty).
+  opCapturedPhotosByChannel: loadOpCapturedPhotosFromSession(),
 
   setProjects: (projects) => set({ projects }),
   addProject: (project) => set((s) => {
@@ -596,11 +677,31 @@ export const useSaatirilStore = create<SaatirilState>((set, get) => ({
   setCurrentScreen: (screen) => set({ currentScreen: screen }),
   setCurrentTab: (tab) => set({ currentTab: tab }),
   setOpCurrentTarget: (target, channel) => set((s) => ({ opCurrentTargets: { ...s.opCurrentTargets, [channel]: target } })),
-  setOpCapturedPhotos: (photos, channel) => set((s) => ({ opCapturedPhotosByChannel: { ...s.opCapturedPhotosByChannel, [channel]: photos } })),
-  addOpCapturedPhoto: (photo, channel) => set((s) => ({ opCapturedPhotosByChannel: { ...s.opCapturedPhotosByChannel, [channel]: [...(s.opCapturedPhotosByChannel[channel] ?? []), photo] } })),
-  resetOpState: (channel) => set((s) => channel
-    ? { opCurrentTargets: { ...s.opCurrentTargets, [channel]: null }, opCapturedPhotosByChannel: { ...s.opCapturedPhotosByChannel, [channel]: [] } }
-    : { opCurrentTargets: {}, opCapturedPhotosByChannel: {} }),
+  setOpCapturedPhotos: (photos, channel) => {
+    set((s) => {
+      const next = { ...s.opCapturedPhotosByChannel, [channel]: photos }
+      // BUG #16: mirror to sessionStorage so a refresh restores in-progress photos.
+      saveOpCapturedPhotosToSession(next)
+      return { opCapturedPhotosByChannel: next }
+    })
+  },
+  addOpCapturedPhoto: (photo, channel) => {
+    set((s) => {
+      const next = { ...s.opCapturedPhotosByChannel, [channel]: [...(s.opCapturedPhotosByChannel[channel] ?? []), photo] }
+      // BUG #16: persist to sessionStorage immediately so a refresh captures
+      // the in-progress photo before finalize.
+      saveOpCapturedPhotosToSession(next)
+      return { opCapturedPhotosByChannel: next }
+    })
+  },
+  resetOpState: (channel) => set((s) => {
+    const next = channel
+      ? { opCurrentTargets: { ...s.opCurrentTargets, [channel]: null }, opCapturedPhotosByChannel: { ...s.opCapturedPhotosByChannel, [channel]: [] } }
+      : { opCurrentTargets: {}, opCapturedPhotosByChannel: {} }
+    // BUG #16: clear the corresponding sessionStorage entry (or all of it).
+    saveOpCapturedPhotosToSession(next.opCapturedPhotosByChannel)
+    return next
+  }),
 
   loadProjectsFromStorage: () => {
     try {

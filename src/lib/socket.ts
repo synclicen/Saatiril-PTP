@@ -9,6 +9,19 @@ export type LocalNetworkCallback = (data: any) => void
 let socket: Socket | null = null
 const listeners: Record<string, LocalNetworkCallback[]> = {}
 
+// BUG #12 (audit-electron-side): guard against double-connect race. Tracks
+// whether a connect attempt is currently in flight (between io() call and the
+// first 'connect' / 'connect_error' / 'disconnect' event). If a second
+// connectSocket() call happens while this is true, we return the existing
+// in-flight socket instead of discarding it mid-handshake.
+let isConnecting: boolean = false
+
+// BUG #13 (audit-electron-side): module-level handle for the manual reconnect
+// interval started by the 'reconnect_failed' handler. Storing it here lets us
+// clear a previous interval before starting a new one — prevents interval
+// stacking when reconnect_failed fires repeatedly on flaky WiFi.
+let manualRetryInterval: ReturnType<typeof setInterval> | null = null
+
 // ─── Session password (hash) ───────────────────────────────────────────────
 // Stored locally so we can re-identify on reconnect
 let currentSessionPasswordHash: string | null = null
@@ -302,10 +315,15 @@ const eventQueue: QueuedEvent[] = []
 // NOTE: This queue is ONLY for relay reliability (re-emitting events after a
 // WiFi drop/reconnect). It is NOT the source of truth for photos — disk saves
 // (admin's handlePhotosSaved + operator's local redundancy) are the source of
-// truth and are UNCAPPED. 2000 is large enough that PHOTOS_SAVED events for a
-// 4000+ participant event are never dropped from the offline queue during
-// extended WiFi congestion.
-const MAX_QUEUE_SIZE = 2000
+// truth and are UNCAPPED.
+//
+// BUG #6 (audit-electron-side): raised from 2000 → 10000. With dual-photoshoot
+// (2 operators) emitting ~2 critical events per capture, 2000 only covered
+// ~1000 captures (~16 min at 1 capture/sec) of WiFi outage — older PHOTOS_SAVED
+// events were dropped from the queue. 10000 covers ~5000 captures (~80 min)
+// which is far beyond any realistic WiFi outage during a ceremony. Worst-case
+// memory at 10000 × ~50KB/event ≈ 500MB — acceptable for a ceremony laptop.
+const MAX_QUEUE_SIZE = 10000
 const MAX_RETRIES = 5     // More retries for unreliable WiFi
 const CRITICAL_EVENTS = new Set(['PHOTOS_SAVED', 'MC_CALL', 'SYNC_DB', 'STUDENT_DONE', 'STUDENT_RESET'])
 
@@ -336,23 +354,51 @@ function queueEvent(event: string, data: any) {
 function flushEventQueue() {
   if (!socket?.connected || eventQueue.length === 0) return
 
-  const toSend = [...eventQueue]
-  eventQueue.length = 0
-
-  for (const item of toSend) {
+  // BUG #6 (audit-electron-side): don't clear the queue BEFORE emitting.
+  // Previously the code did `const toSend = [...eventQueue]; eventQueue.length = 0`
+  // then emitted each item. If the socket disconnected mid-flush, the in-flight
+  // (un-acked) items were LOST — not re-queued. Now we emit each item, then
+  // only drop it from the queue after the emit call returns. Items that we
+  // couldn't emit (socket disconnected mid-flush) are kept in the queue for
+  // the next flush. Items that exceeded MAX_RETRIES are dropped. (Server-side
+  // acks would be even better, but the lan-message handler doesn't ack —
+  // fire-and-forget is the existing contract; this fix at least plugs the
+  // mid-flush disconnect hole.)
+  const remaining: QueuedEvent[] = []
+  for (const item of eventQueue) {
     if (item.retries >= MAX_RETRIES) {
       console.warn(`[SAATIRIL] Dropping event after ${MAX_RETRIES} retries: ${item.event}`)
+      continue
+    }
+    if (!socket?.connected) {
+      // Socket disconnected mid-flush — keep the item for the next flush.
+      remaining.push(item)
       continue
     }
     item.retries++
     socket.emit('lan-message', { event: item.event, data: item.data })
     console.log(`[SAATIRIL] Flushed queued event: ${item.event} (attempt ${item.retries})`)
+    // Item was emitted successfully — don't re-queue.
   }
+  // Rebuild the queue with anything we couldn't emit (preserves order).
+  // Note: new items pushed by emitLocal() during iteration land AFTER these
+  // remaining items, which is fine — they're newer.
+  eventQueue.length = 0
+  for (const r of remaining) eventQueue.push(r)
 }
 
 // ─── Connect Socket ───────────────────────────────────────────────────────
 export function connectSocket(): Socket {
+  // BUG #12 (audit-electron-side): guard against double-connect race. If a
+  // previous connect attempt is still in flight (isConnecting === true), OR
+  // the socket is already connected, return the existing socket instead of
+  // discarding it mid-handshake. Previously the check was only
+  // `if (socket?.connected) return socket` — a still-CONNECTING socket would
+  // be removeAllListeners()'d + disconnect()'d, losing any identify/auth
+  // events already sent on it. The second socket then started fresh, causing
+  // a brief auth glitch + wasted work.
   if (socket?.connected) return socket
+  if (socket && isConnecting) return socket
 
   // Clean up existing disconnected socket before creating a new one
   if (socket) {
@@ -360,6 +406,12 @@ export function connectSocket(): Socket {
     socket.disconnect()
     socket = null
   }
+  // Clear any leftover manual-retry interval from a prior session.
+  if (manualRetryInterval) {
+    clearInterval(manualRetryInterval)
+    manualRetryInterval = null
+  }
+  isConnecting = true
 
   const socketUrl = getSocketUrl()
   const isElectron = !!(window as any).saatirilAPI?.isElectron
@@ -388,6 +440,7 @@ export function connectSocket(): Socket {
 
   // ── Connection lifecycle ──────────────────────────────────────────────
   socket.on('connect', () => {
+    isConnecting = false
     connectTime = Date.now()
     isReconnecting = false
     console.log('[SAATIRIL] Socket connected:', socket?.id, `(reconnects: ${reconnectCount})`)
@@ -445,6 +498,7 @@ export function connectSocket(): Socket {
   })
 
   socket.on('disconnect', (reason) => {
+    isConnecting = false
     console.warn('[SAATIRIL] Socket disconnected. Reason:', reason)
     stopPingMeasurement()
     currentLatencyMs = -1
@@ -461,6 +515,7 @@ export function connectSocket(): Socket {
   })
 
   socket.on('connect_error', (error) => {
+    isConnecting = false
     if (!isReconnecting) {
       isReconnecting = true
       reconnectCount++
@@ -479,10 +534,23 @@ export function connectSocket(): Socket {
 
   socket.on('reconnect_failed', () => {
     console.error('[SAATIRIL] Reconnection failed — will keep trying manually')
-    // Manual retry every 5 seconds
-    const manualRetry = setInterval(() => {
+    // BUG #13 (audit-electron-side): clear any PREVIOUS manual-retry interval
+    // before starting a new one. On flaky WiFi, reconnect_failed can fire
+    // repeatedly (each one starts a new 5s interval) → multiple intervals
+    // stacking up, each calling socket.connect() on the same socket. With
+    // reconnectionAttempts: Infinity (set above in socketOptions) socket.io
+    // already retries forever, so this manual retry is belt-and-suspenders;
+    // we keep it but ensure only ONE is ever running at a time.
+    if (manualRetryInterval) {
+      clearInterval(manualRetryInterval)
+      manualRetryInterval = null
+    }
+    manualRetryInterval = setInterval(() => {
       if (socket?.connected) {
-        clearInterval(manualRetry)
+        if (manualRetryInterval) {
+          clearInterval(manualRetryInterval)
+          manualRetryInterval = null
+        }
         return
       }
       console.log('[SAATIRIL] Manual reconnection attempt...')

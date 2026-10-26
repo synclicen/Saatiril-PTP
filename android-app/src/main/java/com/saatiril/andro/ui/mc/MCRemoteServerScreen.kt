@@ -118,6 +118,26 @@ fun MCRemoteServerScreen(adminViewModel: AdminViewModel) {
 
     // Set up BLE server callbacks
     DisposableEffect(Unit) {
+        // BUG #16 fix: Android allows only ONE GATT server per process. If
+        // AdminViewModel.bleServerManager (the admin-side BLE server, started
+        // when the admin creates a project for MC remotes to connect to) is
+        // still running, opening a SECOND BLEServerManager here will fail
+        // silently (openGattServer returns null) — the MC's "Start
+        // advertising" button shows "failed" with no useful error. Stop the
+        // AdminViewModel's server now (it'll be restarted by
+        // retryBleAdvertising() / startBLEServer() when the user navigates
+        // back to the Admin dashboard and creates/resumes a project).
+        var adminBleWasRunning = false
+        try {
+            if (adminViewModel.bleServerManager.isRunning()) {
+                adminBleWasRunning = true
+                adminViewModel.bleServerManager.stop()
+                android.util.Log.i("MCRemoteServer", "BUG#16: stopped AdminViewModel.bleServerManager to free GATT server slot")
+            }
+        } catch (e: Exception) {
+            android.util.Log.w("MCRemoteServer", "BUG#16: failed to stop AdminViewModel.bleServerManager: ${e.message}")
+        }
+
         // CRITICAL: Receive project data pushed from Electron admin via BLE.
         // Without these callbacks, MC shows "Tidak ada mahasiswa" because
         // the data written by admin-ble.html is received but never processed.
@@ -154,6 +174,18 @@ fun MCRemoteServerScreen(adminViewModel: AdminViewModel) {
 
         onDispose {
             bleServer.stop()
+            // BUG #16: if we stopped AdminViewModel's BLE server on entry,
+            // restart it on exit so the admin-side MC-remote flow still works
+            // when the user navigates back to the Admin dashboard. The
+            // restart is best-effort — if the project is gone (user left the
+            // Admin role entirely), retryBleAdvertising() is a no-op.
+            if (adminBleWasRunning) {
+                try {
+                    adminViewModel.retryBleAdvertising()
+                } catch (e: Exception) {
+                    android.util.Log.w("MCRemoteServer", "BUG#16: failed to restart AdminViewModel.bleServerManager: ${e.message}")
+                }
+            }
             // Tear down the WiFi fallback socket too — otherwise its reconnect
             // loop keeps firing forever after leaving this screen. Both
             // disconnect() and destroy() are idempotent.

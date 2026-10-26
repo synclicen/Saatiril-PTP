@@ -3045,6 +3045,21 @@ function triggerFlash() {
 async function sendPhotos() {
   if (!socket || !currentTarget) return
 
+  // ── Filename helpers (mirror Android FilenameUtils.kt + Electron operator-panel.tsx
+  //    after fix in d07fdeb — sanitize + cap nama at 40 chars and fall back to
+  //    studentId → clock-hex when both sanitize empty so empty Excel rows no
+  //    longer collide on filenames like "___1_Toga.jpg".)
+  function sanitizeNamaStr(s) { return (s||'').trim().replace(/\s+/g,'_').replace(/[^a-zA-Z0-9_]/g,'').slice(0,40); }
+  function sanitizeNimStr(s) { return (s||'').toString().trim().replace(/[^a-zA-Z0-9_-]/g,''); }
+  function buildIdentityPartStr(nim, nama, studentId) {
+    var n = sanitizeNimStr(nim), m = sanitizeNamaStr(nama);
+    if (n && m) return n + '_' + m;
+    if (n) return n;
+    if (m) return m;
+    var id = sanitizeNimStr(studentId).slice(0, 8);
+    return id || Date.now().toString(16).slice(-8);
+  }
+
   const nim = currentTarget.nim || currentTarget.id
   const nama = currentTarget.nama || 'Unknown'
   const mode = currentProject && currentProject.config ? currentProject.config.mode : null
@@ -3053,11 +3068,12 @@ async function sendPhotos() {
 
   const photos = capturedPhotos.map((p, i) => {
     let filename
+    const identity = buildIdentityPartStr(currentTarget.nim, currentTarget.nama, currentTarget.id)
     if (isPsSend) {
-      filename = channel === 1 ? `${nim}_${nama}.jpg` : `${nim}_${nama}_Ch${channel}.jpg`
+      filename = channel === 1 ? `${identity}.jpg` : `${identity}_Ch${channel}.jpg`
     } else {
       const suffix = p.label === 'toga' ? '1_Toga' : '2_Ijazah'
-      filename = `${nim}_${nama}_${suffix}.jpg`
+      filename = `${identity}_${suffix}.jpg`
     }
     return { filename, data: p.dataUrl, label: p.label }
   })

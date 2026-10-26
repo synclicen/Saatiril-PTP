@@ -18,11 +18,19 @@ contextBridge.exposeInMainWorld('saatirilAPI', {
     return ipcRenderer.invoke('create-folder', folderPath)
   },
 
-  savePhoto: (data: { base64Data: string; filename: string; targetFolder: string; backupFolder?: string | null }): Promise<string | null> => {
+  savePhoto: (data: { base64Data: string; filename: string; targetFolder: string; backupFolder?: string | null; projectName?: string | null }): Promise<string | null> => {
     return ipcRenderer.invoke('save-photo', data)
   },
   countPhotos: (data: { targetFolder: string }): Promise<number> => {
     return ipcRenderer.invoke('count-photos', data)
+  },
+
+  // BUG #7 (audit-electron-side): read a photo from disk → base64 data URL.
+  // Used by the admin gallery to lazily rehydrate thumbnails after an app
+  // restart (saveProjectsToStorage strips photo base64 from photoHistory to
+  // stay under localStorage quotas). Returns null if the file is missing.
+  readPhoto: (data: { filename: string; targetFolder: string }): Promise<string | null> => {
+    return ipcRenderer.invoke('read-photo', data)
   },
 
   getLanInfo: (): Promise<{
@@ -31,6 +39,51 @@ contextBridge.exposeInMainWorld('saatirilAPI', {
     ips: { name: string; address: string }[]
   }> => {
     return ipcRenderer.invoke('get-lan-info')
+  },
+
+  // ── Live Mirror projector window ──────────────────────────────────────────
+  // Opens a separate BrowserWindow on the external display (HDMI) showing
+  // ONLY the /mirror page. Returns success=false if no external display is
+  // detected (user needs to connect projector + Windows+P → Extend).
+  openMirrorOnProjector: (channel: number): Promise<{
+    success: boolean
+    reason: string
+    displays: number
+  }> => {
+    return ipcRenderer.invoke('open-mirror-on-projector', channel)
+  },
+
+  closeMirrorProjector: (): Promise<{ success: boolean; reason?: string }> => {
+    return ipcRenderer.invoke('close-mirror-projector')
+  },
+
+  // ── Mirror frame IPC fast path ───────────────────────────────────────────
+  // sendMirrorFrame(blob): sends a JPEG Blob directly to the mirror
+  // projector BrowserWindow via IPC (structured clone — no base64, no
+  // JSON, no socket.io). Much faster than the socket.io path. Called by
+  // the operator panel at 10+ FPS.
+  sendMirrorFrame: (blob: Blob): void => {
+    ipcRenderer.send('send-mirror-frame', blob)
+  },
+
+  // onMirrorFrame(callback): registers a listener for 'mirror-frame' IPC
+  // events. Called by the mirror.html page to receive frames directly
+  // from the operator (bypassing socket.io). Returns a cleanup function
+  // to remove the listener.
+  onMirrorFrame: (callback: (blob: Blob) => void): (() => void) => {
+    const handler = (_event: unknown, blob: Blob): void => {
+      callback(blob)
+    }
+    ipcRenderer.on('mirror-frame', handler)
+    return () => { ipcRenderer.removeListener('mirror-frame', handler) }
+  },
+
+  // isMirrorWindowOpen(): checks if the projector BrowserWindow is
+  // currently open. The operator uses this to decide whether to use the
+  // IPC fast path (window open → IPC) or socket.io slow path (closed →
+  // for cross-device streaming).
+  isMirrorWindowOpen: (): Promise<boolean> => {
+    return ipcRenderer.invoke('is-mirror-window-open')
   },
 
   // ── License API ──────────────────────────────────────────────────────────

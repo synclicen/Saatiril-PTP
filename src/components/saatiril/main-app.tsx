@@ -391,61 +391,19 @@ export function MainApp() {
     onLocal('REQUEST_STATE', handleRequestState)
     onLocal('REQUEST_FRAME', handleRequestFrame)
 
-    // ── MC_CALL: Always handle here (not just in operator-panel) ──
-    // Operator panel may not be mounted (e.g., admin viewing Admin tab).
-    // This ensures MC_CALL always updates the store + opCurrentTarget.
-    const handleMcCallAlways = (data: { student: any; channel: number }) => {
-      const curProj = useSaatirilStore.getState().currentProject
-      if (!curProj) return
-      if (data.channel !== useSaatirilStore.getState().myChannel) return
-
-      // CRITICAL: Set status to active_<channel>, NOT data.student.status.
-      // The browser MC sends the student object with its OLD status ('pending')
-      // because the MC updates its own local copy AFTER emitting MC_CALL.
-      // If we used data.student.status, the admin's store would stay 'pending'
-      // and the internal MC panel would still show "PANGGIL SEKARANG" instead
-      // of "SEDANG DIPANGGIL" — breaking the ceremony flow.
-      // This matches the Android AdminViewModel.handleMcCall (line 1204) which
-      // correctly uses "active_$channel".
-      const newStatus = `active_${data.channel}` as any
-      const updatedStudent = { ...data.student, status: newStatus }
-      const updatedDb = curProj.database.map((s: any) =>
-        s.id === data.student.id ? { ...s, status: newStatus } : s
-      )
-      updateCurrentProject({ ...curProj, database: updatedDb })
-
-      // Set opCurrentTarget so operator panel picks it up when mounted
-      // (per-channel — data.channel routes to the right channel's slice)
-      useSaatirilStore.getState().setOpCurrentTarget(updatedStudent, data.channel)
-
-      // Broadcast SYNC_DB to all clients so browser MC + other operators
-      // get the corrected status (matches Android pushSyncDb after handleMcCall)
-      emitLocal('SYNC_DB', { project: { ...curProj, database: updatedDb } })
-
-      console.log('[SAATIRIL MAIN] MC_CALL processed:', data.student.nama, 'Ch.', data.channel, '→ status:', newStatus)
-    }
-    onLocal('MC_CALL', handleMcCallAlways)
-
-    // ── STUDENT_RESET: Always handle here too ──
-    const handleStudentResetAlways = (data: { studentId: string; channel: number }) => {
-      const curProj = useSaatirilStore.getState().currentProject
-      if (!curProj) return
-      const updatedDb = curProj.database.map((s: any) =>
-        s.id === data.studentId ? { ...s, status: 'pending' as any } : s
-      )
-      const cleanedHistory = curProj.photoHistory.filter((h: any) => h.student.id !== data.studentId)
-      updateCurrentProject({ ...curProj, database: updatedDb, photoHistory: cleanedHistory })
-      useSaatirilStore.getState().setOpCurrentTarget(null, data.channel)
-      console.log('[SAATIRIL MAIN] STUDENT_RESET processed:', data.studentId)
-    }
-    onLocal('STUDENT_RESET', handleStudentResetAlways)
+    // BUG #3 (audit-electron-side): the duplicate MC_CALL + STUDENT_RESET
+    // handlers that previously lived here have been REMOVED. The
+    // admin-dashboard.tsx versions (which are always-mounted) are kept
+    // instead — they are more thorough (photoshoot-aware status, stale
+    // active_N reset, photoHistory cleanup). Having both caused 2x SYNC_DB
+    // broadcasts + 2x store writes per MC_CALL, and the main-app version
+    // lacked the stale-active-N reset logic (so it could leave stale
+    // 'active_N' students in PROSES if it ran last).
 
     return () => {
       offLocal('SYNC_DB', handleSyncDb)
       offLocal('REQUEST_STATE', handleRequestState)
       offLocal('REQUEST_FRAME', handleRequestFrame)
-      offLocal('MC_CALL', handleMcCallAlways)
-      offLocal('STUDENT_RESET', handleStudentResetAlways)
     }
   }, [updateCurrentProject])
 

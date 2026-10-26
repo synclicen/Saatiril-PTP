@@ -1,6 +1,16 @@
 :81 {
+	# BUG #10 fix (audit Remote/Mirror batch 2): port allowlist for the
+	# XTransformPort gateway. Previously the matcher `query XTransformPort=*`
+	# accepted ANY port value, so anyone on the LAN could proxy Caddy to an
+	# arbitrary internal port (SSRF exposure): e.g. ?XTransformPort=631 →
+	# CUPS admin, ?XTransformPort=8080 → management consoles, ?XTransformPort=6379
+	# → Redis, ?XTransformPort=22 → SSH banner grab. Now we only allow the
+	# socket.io relay port (3003) + a small auto-increment range (3004-3008)
+	# that electron/main.ts falls back to when 3003 is already in use. Any
+	# other port fails to match → falls through to the default 3000 reverse
+	# proxy (no SSRF).
 	@transform_port_query {
-		query XTransformPort=*
+		query XTransformPort 3003 3004 3005 3006 3007 3008
 	}
 
 	handle @transform_port_query {

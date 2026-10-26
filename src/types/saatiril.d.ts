@@ -49,6 +49,8 @@ interface SaatirilAPI {
   createFolder: (path: string) => Promise<{ success: boolean; path?: string; error?: string }>
   savePhoto: (data: { base64Data: string; filename: string; targetFolder: string; backupFolder?: string | null }) => Promise<string | null>
   countPhotos: (data: { targetFolder: string }) => Promise<number>
+  // BUG #7 (audit-electron-side): lazy thumbnail rehydration after restart.
+  readPhoto: (data: { filename: string; targetFolder: string }) => Promise<string | null>
   getLanInfo: () => Promise<{
     httpPort: number
     socketPort: number

@@ -13,6 +13,8 @@ import android.bluetooth.le.ScanFilter
 import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
 import android.content.Context
+import android.os.Handler
+import android.os.Looper
 import android.os.ParcelUuid
 import android.util.Log
 import org.json.JSONObject
@@ -43,6 +45,33 @@ class BLEClientManager(private val context: Context) {
     private var isScanning = false
     private var isConnected = false
     private var isConnecting = false
+
+    // BUG #5 fix: auto-reconnect state. When the GATT connection drops
+    // unexpectedly (out of range, BLE stack hiccup, …) we remember the last
+    // device + schedule a reconnect with exponential backoff. The retry
+    // stops as soon as close() is called (user explicitly tearing down) —
+    // disconnect() alone does NOT stop retries (the user expects auto-recovery
+    // after a manual re-connect attempt from the UI).
+    @Volatile private var lastConnectedDevice: BluetoothDevice? = null
+    @Volatile private var isClosing = false
+    @Volatile private var reconnectAttempts = 0
+    // BUG #5 fix: reconnectHandler + reconnectRunnable moved to AFTER gattCallback
+    // declaration (see below) to avoid Kotlin "Type checking has run into a recursive
+    // problem" error — reconnectRunnable references gattCallback which was declared
+    // after it.
+
+    /**
+     * BUG #5 helper: schedule a reconnect attempt with exponential backoff
+     * (1s, 2s, 4s, 8s, capped at 15s). No-op if close() was called.
+     */
+    private fun scheduleReconnect() {
+        if (isClosing) return
+        val delayMs = (1L shl reconnectAttempts.coerceAtMost(4)) * 1000L  // 1,2,4,8,16s
+        val actualDelay = delayMs.coerceAtMost(15_000L)
+        reconnectHandler.removeCallbacks(reconnectRunnable)
+        reconnectHandler.postDelayed(reconnectRunnable, actualDelay)
+        Log.i(TAG, "BUG#5: scheduled reconnect in ${actualDelay}ms (attempt #${reconnectAttempts + 1})")
+    }
 
     // Serialized GATT setup operations. Android's BLE stack allows only ONE
     // in-flight GATT operation — issuing writeDescriptor/readCharacteristic
@@ -166,12 +195,23 @@ class BLEClientManager(private val context: Context) {
         }
         bluetoothGatt = gatt
         isConnecting = true
+        // BUG #5: remember this device for auto-reconnect. Reset retry counter
+        // — this is a fresh user-initiated connect. Clear the closing flag
+        // (the user explicitly (re)connected, so auto-reconnect is wanted).
+        lastConnectedDevice = device
+        isClosing = false
+        reconnectAttempts = 0
+        reconnectHandler.removeCallbacks(reconnectRunnable)
         Log.i(TAG, "Connecting to ${device.address}...")
         return true
     }
 
     /** Disconnect from the Admin device. */
     fun disconnect() {
+        // BUG #5: disconnect() does NOT stop auto-reconnect — the user may be
+        // initiating a manual reconnect flow that expects the auto-retry to
+        // keep working if the manual attempt fails. Only close() stops the
+        // retry loop (explicit teardown).
         bluetoothGatt?.let { gatt ->
             try { gatt.disconnect() } catch (_: Exception) {}
         }
@@ -179,6 +219,11 @@ class BLEClientManager(private val context: Context) {
 
     /** Close the GATT client completely. */
     fun close() {
+        // BUG #5: stop the auto-reconnect loop — this is an explicit teardown.
+        isClosing = true
+        reconnectHandler.removeCallbacks(reconnectRunnable)
+        lastConnectedDevice = null
+        reconnectAttempts = 0
         disconnect()
         try { bluetoothGatt?.close() } catch (_: Exception) {}
         bluetoothGatt = null
@@ -190,13 +235,17 @@ class BLEClientManager(private val context: Context) {
 
     // ── GATT Callback ──
 
-    private val gattCallback = object : BluetoothGattCallback() {
+    private val gattCallback: BluetoothGattCallback = object : BluetoothGattCallback() {
 
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
             when (newState) {
                 BluetoothProfile.STATE_CONNECTED -> {
                     isConnected = true
                     isConnecting = false
+                    // BUG #5: connection (re)established — reset retry counter
+                    // so the next drop starts at 1s backoff again.
+                    reconnectAttempts = 0
+                    reconnectHandler.removeCallbacks(reconnectRunnable)
                     Log.i(TAG, "Connected to Admin — requesting larger MTU...")
                     // Request a larger MTU (517) BEFORE service discovery + reads.
                     // The queue data JSON (~650-850B for 10 students) exceeds the
@@ -220,6 +269,15 @@ class BLEClientManager(private val context: Context) {
                     connectedDevicesClear()
                     Log.i(TAG, "Disconnected from Admin")
                     onConnectionStateChanged?.invoke(false)
+                    // BUG #5: schedule an auto-reconnect (exponential backoff)
+                    // unless close() was the cause of this disconnect. close()
+                    // sets isClosing=true BEFORE calling disconnect() — that
+                    // flag is the explicit-teardown signal.
+                    if (!isClosing && lastConnectedDevice != null) {
+                        try { gatt.close() } catch (_: Exception) {}  // release GATT resources for the retry
+                        bluetoothGatt = null
+                        scheduleReconnect()
+                    }
                 }
             }
         }
@@ -344,6 +402,32 @@ class BLEClientManager(private val context: Context) {
             } else {
                 Log.e(TAG, "Trigger write failed: status=$status")
             }
+            // BUG #11 fix: advance the GATT op queue so the next queued op
+            // (e.g. another trigger, or a queued read/subscribe) can run.
+            // Without this, a failed trigger write would stall the queue
+            // forever and all subsequent triggers would be silently dropped.
+            onGattOpFinished(gatt)
+        }
+    }
+
+    // BUG #5 fix: reconnectHandler + reconnectRunnable declared AFTER gattCallback
+    // to avoid Kotlin recursive type checking error (reconnectRunnable references
+    // gattCallback in connectGatt call).
+    private val reconnectHandler = Handler(Looper.getMainLooper())
+    private val reconnectRunnable = Runnable {
+        val device = lastConnectedDevice ?: return@Runnable
+        if (isClosing || isConnected || isConnecting) return@Runnable
+        Log.i(TAG, "BUG#5: auto-reconnect attempt #${reconnectAttempts + 1} (device=${device.address})")
+        reconnectAttempts++
+        try {
+            val gatt = device.connectGatt(context, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
+            if (gatt != null) {
+                try { bluetoothGatt?.close() } catch (_: Exception) {}
+                bluetoothGatt = gatt
+                isConnecting = true
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "BUG#5: reconnect connectGatt failed: ${e.message}")
         }
     }
 
@@ -365,13 +449,29 @@ class BLEClientManager(private val context: Context) {
             put("action", action)
             studentId?.let { put("studentId", it) }
         }.toString()
+        val bytes = json.toByteArray(StandardCharsets.UTF_8)
 
-        triggerChar!!.value = json.toByteArray(StandardCharsets.UTF_8)
-        triggerChar!!.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
-
-        val result = bluetoothGatt?.writeCharacteristic(triggerChar) ?: false
-        Log.i(TAG, "Sending trigger: $json (result=$result)")
-        return result
+        // BUG #11 fix: route through the pendingGattOps queue. Android's BLE
+        // stack allows only ONE in-flight GATT operation at a time — calling
+        // writeCharacteristic() directly here while another op (descriptor
+        // write, characteristic read, …) is in flight silently drops the
+        // trigger write on many stacks (notably pre-Android-13). The setup
+        // subscribes/reads already use this queue; triggers were the lone
+        // exception. Now they line up behind any in-flight op too.
+        val char = triggerChar!!
+        char.value = bytes
+        char.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+        val gatt = bluetoothGatt
+        if (gatt == null) {
+            Log.w(TAG, "sendTrigger: bluetoothGatt is null — cannot queue")
+            return false
+        }
+        pendingGattOps.addLast { g -> g.writeCharacteristic(char) }
+        // If nothing is in flight, kick the queue now. If an op is in flight,
+        // onGattOpFinished will pick this one up when the current op completes.
+        runNextGattOp(gatt)
+        Log.i(TAG, "Sending trigger (queued): $json")
+        return true
     }
 
     // ── Helpers ──

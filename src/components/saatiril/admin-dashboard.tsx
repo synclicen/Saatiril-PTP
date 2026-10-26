@@ -61,23 +61,44 @@ const CYAN = '#06b6d4'
 // ── Helper: sanitize nama for filenames ──────────────────────────
 // DEFENSIVE: nama/nim can be undefined if a photoHistory entry got corrupted
 // during reset+retake cycles. Never let .trim() crash the whole app.
+// (matches Android FilenameUtils.kt after fix in d07fdeb — sanitize + cap
+//  nama at 40 chars and fall back to studentId → clock-hex when both sanitize
+//  empty so empty Excel rows no longer collide on filenames like "___1_Toga.jpg".)
+const MAX_NAMA_LENGTH = 40
+
 function sanitizeNama(nama: string | undefined | null): string {
   return (nama ?? '')
     .trim()
     .replace(/\s+/g, '_')
     .replace(/[^a-zA-Z0-9_]/g, '')
+    .slice(0, MAX_NAMA_LENGTH)
 }
 
 function sanitizeNim(nim: string | undefined | null): string {
   return (nim ?? '').toString().trim().replace(/[^a-zA-Z0-9_-]/g, '')
 }
 
+/** Build the "NIM_Nama" identity part of a filename.
+ *  - both present → "NIM_Nama"
+ *  - only one present → that part alone (no dangling "_")
+ *  - both empty → first 8 chars of studentId, else a clock-derived hex.
+ */
+function buildIdentityPart(nim: string | undefined, nama: string | undefined, studentId?: string): string {
+  const nimPart = sanitizeNim(nim)
+  const namaPart = sanitizeNama(nama)
+  if (nimPart && namaPart) return `${nimPart}_${namaPart}`
+  if (nimPart) return nimPart
+  if (namaPart) return namaPart
+  const idPart = sanitizeNim(studentId).slice(0, 8)
+  return idPart || Date.now().toString(16).slice(-8)
+}
+
 /**
  * Build a versioned filename for standard mode (Toga + Ijazah).
  * version: 1 = first capture, 2+ = retake after MC reset.
  */
-function buildFilename(nim: string | undefined, nama: string | undefined, suffix: number, type: string, version: number = 1): string {
-  const base = `${sanitizeNim(nim)}_${sanitizeNama(nama)}_${suffix}_${type}`
+function buildFilename(nim: string | undefined, nama: string | undefined, suffix: number, type: string, version: number = 1, studentId?: string): string {
+  const base = `${buildIdentityPart(nim, nama, studentId)}_${suffix}_${type}`
   return version > 1 ? `${base}_v${version}.jpg` : `${base}.jpg`
 }
 
@@ -85,8 +106,8 @@ function buildFilename(nim: string | undefined, nama: string | undefined, suffix
  * Build a versioned filename for photoshoot mode.
  * version: 1 = first capture, 2+ = retake after MC reset.
  */
-function buildPhotoshootFilename(nim: string | undefined, nama: string | undefined, channel: number, version: number = 1): string {
-  const base = `${sanitizeNim(nim)}_${sanitizeNama(nama)}`
+function buildPhotoshootFilename(nim: string | undefined, nama: string | undefined, channel: number, version: number = 1, studentId?: string): string {
+  const base = buildIdentityPart(nim, nama, studentId)
   const withCh = channel > 1 ? `${base}_Ch${channel}` : base
   return version > 1 ? `${withCh}_v${version}.jpg` : `${withCh}.jpg`
 }
@@ -126,6 +147,41 @@ interface SyncDbData {
     database: Student[]
     photoHistory: PhotoHistoryItem[]
   }
+}
+
+// BUG #7 (audit-electron-side): LazyThumbnail — lazily rehydrates a photo
+// thumbnail from disk via the read-photo IPC. Used by the admin gallery for
+// photoHistory entries whose `photos` array is empty (which happens after an
+// app restart — saveProjectsToStorage strips base64 to stay under localStorage
+// quotas). Falls back to the ImageIcon placeholder if the file is missing or
+// the IPC is unavailable (browser mode). Memoized so each (filename, folder)
+// pair is fetched at most once per mount.
+interface LazyThumbnailProps {
+  filename: string
+  targetFolder: string
+  alt: string
+  className?: string
+}
+function LazyThumbnail({ filename, targetFolder, alt, className }: LazyThumbnailProps) {
+  const [src, setSrc] = useState<string | null>(null)
+  // useRef (not useState) for the tried-guard so we don't trigger a synchronous
+  // setState-in-effect lint error + don't cause a cascading re-render.
+  const triedRef = useRef(false)
+  useEffect(() => {
+    if (triedRef.current) return
+    triedRef.current = true
+    const api = typeof window !== 'undefined' ? window.saatirilAPI : undefined
+    if (!api?.readPhoto || !targetFolder || !filename) return
+    let cancelled = false
+    api.readPhoto({ filename, targetFolder }).then((dataUrl) => {
+      if (!cancelled && dataUrl) setSrc(dataUrl)
+    }).catch(() => { /* leave placeholder */ })
+    return () => { cancelled = true }
+  }, [filename, targetFolder])
+  if (src) {
+    return <img src={src} alt={alt} loading="lazy" decoding="async" className={className} />
+  }
+  return <ImageIcon className="size-5 text-[#533485]" />
 }
 
 // ── Component ────────────────────────────────────────────────────
@@ -223,7 +279,14 @@ export default function AdminDashboard() {
   // ── Socket listeners ─────────────────────────────────────────────
   useEffect(() => {
     const handlePhotosSaved = (data: PhotosSavedData) => {
-      const proj = currentProjectRef.current
+      // BUG FIX (audit Electron BUG #2): use sync getState() read instead of
+      // stale currentProjectRef.current. The ref only updates via useEffect
+      // after render — back-to-back PHOTOS_SAVED events (dual-photoshoot:
+      // both operators capture simultaneously, or socket.io batches events)
+      // would both read the SAME stale proj → second event OVERWRITES first
+      // event's photoHistory entry → first student's photo LOST + stuck in
+      // PROSES forever. Sync read from the store always returns the latest.
+      const proj = useSaatirilStore.getState().currentProject
       if (!proj) return
 
       // ── Determine version + filenames ──────────────────────────────────
@@ -249,11 +312,11 @@ export default function AdminDashboard() {
         // Wisuda mode (single/dual) → 2 photos (buildFilename Toga + Ijazah).
         const items: { base64Data: string; filename: string }[] = []
         if (photoshootMode) {
-          const filename = data.filename ?? buildPhotoshootFilename(data.student.nim, data.student.nama, data.channel, version)
+          const filename = data.filename ?? buildPhotoshootFilename(data.student.nim, data.student.nama, data.channel, version, data.student.id)
           items.push({ base64Data: data.photos[0], filename })
         } else {
-          const togaFilename = buildFilename(data.student.nim, data.student.nama, 1, 'Toga', version)
-          const ijazahFilename = buildFilename(data.student.nim, data.student.nama, 2, 'Ijazah', version)
+          const togaFilename = buildFilename(data.student.nim, data.student.nama, 1, 'Toga', version, data.student.id)
+          const ijazahFilename = buildFilename(data.student.nim, data.student.nama, 2, 'Ijazah', version, data.student.id)
           items.push({ base64Data: data.photos[0], filename: togaFilename })
           items.push({ base64Data: data.photos[1], filename: ijazahFilename })
         }
@@ -289,6 +352,10 @@ export default function AdminDashboard() {
                   // which copies the photo to this folder after the local save.
                   // NOT auto-connected — the admin explicitly sets it per-project.
                   backupFolder: proj.config?.driveFolder ?? null,
+                  // Pass projectName so the Electron savePhoto IPC creates a
+                  // project subfolder in the backup folder (mirrors local
+                  // structure: backupFolder/projectName/filename).
+                  projectName: proj.name,
                 })
                 if (p) {
                   console.log(`[SAATIRIL ADMIN] Photo saved to disk (Electron IPC, v${version}): ${item.filename} → ${p}`)
@@ -408,15 +475,19 @@ export default function AdminDashboard() {
         newHistory = [...proj.photoHistory, historyItem]
       }
 
-      // Check completion: in dual-photoshoot mode, EITHER camera is sufficient
-      // (the participant is considered done after 1 of the 2 cameras takes a photo).
-      // In single-photoshoot mode, the single channel is sufficient.
-      // In non-photoshoot modes, mark done immediately.
+      // Check completion: in dual-photoshoot mode, BOTH cameras must photograph
+      // (the participant is done only after channel 1 AND channel 2 each have
+      // a photoHistory entry with photos). In single-photoshoot mode, the
+      // single channel is sufficient. In non-photoshoot modes, mark done
+      // immediately.
+      // (matches Android AdminViewModel.handlePhotosSaved after fix in d07fdeb —
+      // the old `||` marked done after either channel, causing the second
+      // channel operator to skip the student and miss the second photo.)
       let allChannelsDone = true
       if (isDualPhotoshootMode(proj.config.mode)) {
-        const ch1Done = newHistory.some((h) => h.student.id === data.student.id && h.channel === 1)
-        const ch2Done = newHistory.some((h) => h.student.id === data.student.id && h.channel === 2)
-        allChannelsDone = ch1Done || ch2Done
+        const ch1Done = newHistory.some((h) => h.student.id === data.student.id && h.channel === 1 && h.photos.length > 0)
+        const ch2Done = newHistory.some((h) => h.student.id === data.student.id && h.channel === 2 && h.photos.length > 0)
+        allChannelsDone = ch1Done && ch2Done
       } else if (photoshootMode) {
         // Single photoshoot: one channel is enough
         allChannelsDone = true
@@ -516,6 +587,25 @@ export default function AdminDashboard() {
       if (!curProj) return
       const isPs = isPhotoshootMode(curProj.config.mode)
       const newStatus = (isPs ? 'sent' : `active_${data.channel}`) as StudentStatus
+
+      // BUG #19 (audit-electron-side): pre-compute the photographed-id Set ONCE
+      // per MC_CALL instead of calling photoHistory.some() inside the .map()
+      // callback for every stale-active student. The previous code was
+      // O(database.length) + O(num_stale_active × photoHistory.length) per
+      // MC_CALL; with hundreds of MC_CALLs during a ceremony that caused
+      // GC pressure + 50-200ms main-thread blocks on slow admin laptops.
+      // Now: O(database.length) + O(photoHistory.length) total — the
+      // per-student check is O(1). Also short-circuit: there's at most 1
+      // stale active_N per channel at any time (we reset on every MC_CALL),
+      // so once we've reset one we can stop scanning for stale actives.
+      const targetActiveStatus = `active_${data.channel}`
+      const photographedIds = new Set<string>()
+      if (!isPs) {
+        for (const h of curProj.photoHistory) {
+          if (h.channel === data.channel) photographedIds.add(h.student.id)
+        }
+      }
+      let didResetStale = false
       const updatedDb = curProj.database.map((s: any) => {
         if (s.id === data.student.id) return { ...s, status: newStatus }
         // Wisuda sequential (non-photoshoot): reset any OTHER stale 'active_N'
@@ -525,10 +615,9 @@ export default function AdminDashboard() {
         // photographed (in photoHistory). Without this, stale 'active_N' accu-
         // mulate in PROSES (mirrors the MC's handleCallNow fix). Photoshoot
         // mode uses 'sent' (not 'active_N') so it's unaffected.
-        if (!isPs && s.status === `active_${data.channel}`) {
-          const photographed = curProj.photoHistory.some(
-            (h: any) => h.student.id === s.id && h.channel === data.channel,
-          )
+        if (!isPs && !didResetStale && s.status === targetActiveStatus) {
+          didResetStale = true  // short-circuit: at most 1 stale active per channel
+          const photographed = photographedIds.has(s.id)
           return { ...s, status: (photographed ? 'done' : 'pending') as StudentStatus }
         }
         return s
@@ -591,7 +680,14 @@ export default function AdminDashboard() {
           const resetDb = proj.database.map(s =>
             s.id === active.id ? { ...s, status: 'pending' as StudentStatus } : s
           )
-          const nextPending = resetDb.find(s => s.status === 'pending')
+          // BUG #11 (audit-electron-side): exclude the just-reset student from
+          // the nextPending search. Previously `resetDb.find(s => s.status ===
+          // 'pending')` could find the SAME student we just reset (when only
+          // 1 non-done student remained) → 'NEXT' re-called the same student
+          // instead of advancing. Now we exclude active.id; if no OTHER
+          // pending student exists (end-of-ceremony edge case), we simply
+          // don't call anyone — the MC can manually call the next student.
+          const nextPending = resetDb.find(s => s.status === 'pending' && s.id !== active.id)
           if (nextPending) {
             const newStatus = `active_${channel}` as StudentStatus
             const updatedDb = resetDb.map(s =>
@@ -599,6 +695,11 @@ export default function AdminDashboard() {
             )
             updateCurrentProject({ ...proj, database: updatedDb })
             emitLocal('MC_CALL', { student: { ...nextPending, status: newStatus }, channel })
+          } else {
+            // No other pending student — just commit the reset (the active
+            // student goes back to 'pending' without calling anyone new).
+            updateCurrentProject({ ...proj, database: resetDb })
+            console.log('[SAATIRIL BLE] NEXT: no other pending student — reset only')
           }
         }
       } else if (data.action === 'RESET') {
@@ -783,27 +884,25 @@ export default function AdminDashboard() {
       // operator.html which had drifted from the React panels.)
       const path = '/?role=' + role
 
-      // Include the session password so the browser MC/Operator page can
-      // authenticate with the admin's socket server. Without it, if the admin
-      // set a session password, the browser page loads with no password →
-      // identify without the hash → auth-failed → MC_CALL/SYNC_DB rejected
-      // → "doesn't work" in Chrome. (Electron Apps collect the password via
-      // connection.html; the browser page relies on the ?password= URL param.)
-      const pwd = (currentProject?.config?.sessionPassword && currentProject.config.sessionPassword !== '__PASSWORD_SET__')
-        ? currentProject.config.sessionPassword
-        : (currentProject ? (localStorage.getItem('saatiril_pwd_plain_' + currentProject.id) || '') : '')
-      const pwdParam = pwd ? `&password=${encodeURIComponent(pwd)}` : ''
+      // BUG #9 fix (audit Remote/Mirror batch 2): session password is NO
+      // LONGER embedded in the QR code / copied URL. Passing ?password= in a
+      // URL is insecure (browser history, server logs, referrer headers, and
+      // the QR code itself becomes a credential). The browser MC/Operator
+      // page now ALWAYS prompts for the password via showPasswordPrompt when
+      // the server demands one (auth-requirement / auth-failed). The Electron
+      // apps already collect the password via connection.html. So no pwdParam
+      // is appended here — the QR code encodes ONLY ip/port/channel/role.
 
       if (isElectron) {
         try {
           const info = lanInfo || (await api.getLanInfo())
           const ips = info.ips
           const lanIP = ips.length > 0 ? ips[0].address : 'localhost'
-          return `http://${lanIP}:${info.httpPort}${path}&channel=${channel}&socketPort=${info.socketPort}&v=23${pwdParam}`
+          return `http://${lanIP}:${info.httpPort}${path}&channel=${channel}&socketPort=${info.socketPort}&v=23`
         } catch {
           const hostname = window.location.hostname
           const socketPort = new URLSearchParams(window.location.search).get('socketPort') || '3003'
-          return `http://${hostname}:3000${path}&channel=${channel}&socketPort=${socketPort}&v=23${pwdParam}`
+          return `http://${hostname}:3000${path}&channel=${channel}&socketPort=${socketPort}&v=23`
         }
       } else {
         const socketPort = new URLSearchParams(window.location.search).get('socketPort') || '3003'
@@ -840,10 +939,10 @@ export default function AdminDashboard() {
           }
         }
 
-        return `${origin}${path}&channel=${channel}&socketPort=${socketPort}&v=23${pwdParam}`
+        return `${origin}${path}&channel=${channel}&socketPort=${socketPort}&v=23`
       }
     },
-    [lanInfo, currentProject],
+    [lanInfo],
   )
 
   // ── Generate download link helper ────────────────────────────────
@@ -978,11 +1077,9 @@ export default function AdminDashboard() {
       // operator.html which had drifted from the React panels.)
       const path = '/?role=' + role
 
-      // Include the session password (see generateLink for rationale).
-      const pwd = (currentProject?.config?.sessionPassword && currentProject.config.sessionPassword !== '__PASSWORD_SET__')
-        ? currentProject.config.sessionPassword
-        : (currentProject ? (localStorage.getItem('saatiril_pwd_plain_' + currentProject.id) || '') : '')
-      const pwdParam = pwd ? `&password=${encodeURIComponent(pwd)}` : ''
+      // BUG #9 fix (audit Remote/Mirror batch 2): no password in URL (see
+      // generateLink above for full rationale). QR codes / copied links
+      // encode ONLY ip/port/channel/role.
 
       let url: string
       if (isElectron) {
@@ -990,12 +1087,12 @@ export default function AdminDashboard() {
           const info = lanInfo || (await api.getLanInfo())
           const ips = info.ips
           const lanIP = ips.length > 0 ? ips[0].address : 'localhost'
-          url = `http://${lanIP}:${info.httpPort}${path}&channel=${channel}&socketPort=${info.socketPort}&v=23${pwdParam}`
+          url = `http://${lanIP}:${info.httpPort}${path}&channel=${channel}&socketPort=${info.socketPort}&v=23`
         } catch {
           const hostname = window.location.hostname
           const params = new URLSearchParams(window.location.search)
           const socketPort = params.get('socketPort') || '3003'
-          url = `http://${hostname}:3000${path}&channel=${channel}&socketPort=${socketPort}&v=23${pwdParam}`
+          url = `http://${hostname}:3000${path}&channel=${channel}&socketPort=${socketPort}&v=23`
         }
       } else {
         // Web/sandbox mode: include socketPort so LAN clients can connect to the Socket.io server
@@ -1038,7 +1135,7 @@ export default function AdminDashboard() {
           }
         }
 
-        url = `${origin}${path}&channel=${channel}&socketPort=${socketPort}&v=23${pwdParam}`
+        url = `${origin}${path}&channel=${channel}&socketPort=${socketPort}&v=23`
       }
       try {
         if (navigator.clipboard) {
@@ -2334,6 +2431,12 @@ export default function AdminDashboard() {
     const versionKey = `${student.id}_${channel}`
     const version = currentProject?.captureVersions?.[versionKey] ?? 1
 
+    // BUG #7 (audit-electron-side): targetFolder for lazy thumbnail
+    // rehydration. When `photos` is empty (after app restart — base64 stripped
+    // by saveProjectsToStorage to fit localStorage), we lazy-load the file
+    // from disk via the read-photo IPC + LazyThumbnail component.
+    const targetFolder = currentProject?.config?.targetFolder ?? ''
+
     const channelLabel = mode === 'dual' ? (channel === 1 ? 'Kiri' : 'Kanan')
       : mode === 'dual-photoshoot' ? (channel === 1 ? 'Cam 1' : 'Cam 2')
       : 'Ch.1'
@@ -2343,7 +2446,7 @@ export default function AdminDashboard() {
 
     // Photoshoot: 1 photo with data-based name
     if (photoshoot) {
-      const filename = buildPhotoshootFilename(student.nim, student.nama, channel, version)
+      const filename = buildPhotoshootFilename(student.nim, student.nama, channel, version, student.id)
       return (
         <div
           key={`${student.id}-${channel}-${index}`}
@@ -2378,7 +2481,8 @@ export default function AdminDashboard() {
                 {photos[0] ? (
                   <img src={photos[0]} alt="Foto" loading="lazy" decoding="async" className="h-full w-full object-cover" />
                 ) : (
-                  <ImageIcon className="size-5 text-[#533485]" />
+                  /* BUG #7: lazy-load from disk after restart */
+                  <LazyThumbnail filename={filename} targetFolder={targetFolder} alt="Foto" className="h-full w-full object-cover" />
                 )}
               </div>
               <span className="truncate text-[10px] text-[#c4b5fd]/60" title={filename}>
@@ -2391,8 +2495,8 @@ export default function AdminDashboard() {
     }
 
     // Standard mode: 2 photos (Toga + Ijazah)
-    const togaFilename = buildFilename(student.nim, student.nama, 1, 'Toga', version)
-    const ijazahFilename = buildFilename(student.nim, student.nama, 2, 'Ijazah', version)
+    const togaFilename = buildFilename(student.nim, student.nama, 1, 'Toga', version, student.id)
+    const ijazahFilename = buildFilename(student.nim, student.nama, 2, 'Ijazah', version, student.id)
 
     return (
       <div
@@ -2436,7 +2540,8 @@ export default function AdminDashboard() {
               {photos[0] ? (
                 <img src={photos[0]} alt="Toga" loading="lazy" decoding="async" className="h-full w-full object-cover" />
               ) : (
-                <ImageIcon className="size-5 text-[#533485]" />
+                /* BUG #7: lazy-load from disk after restart */
+                <LazyThumbnail filename={togaFilename} targetFolder={targetFolder} alt="Toga" className="h-full w-full object-cover" />
               )}
             </div>
             <span className="truncate text-[10px] text-[#c4b5fd]/60" title={togaFilename}>
@@ -2449,7 +2554,8 @@ export default function AdminDashboard() {
               {photos[1] ? (
                 <img src={photos[1]} alt="Ijazah" loading="lazy" decoding="async" className="h-full w-full object-cover" />
               ) : (
-                <ImageIcon className="size-5 text-[#533485]" />
+                /* BUG #7: lazy-load from disk after restart */
+                <LazyThumbnail filename={ijazahFilename} targetFolder={targetFolder} alt="Ijazah" className="h-full w-full object-cover" />
               )}
             </div>
             <span className="truncate text-[10px] text-[#c4b5fd]/60" title={ijazahFilename}>

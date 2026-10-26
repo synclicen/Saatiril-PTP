@@ -84,6 +84,128 @@ var isConnected = false;
 var dataSyncInterval = null;
 var saSocket = null;
 var saSocketConnected = false;
+// BUG #13 fix (audit Remote/Mirror batch 2): track the session password hash
+// so admin-ble.html can authenticate when the admin set a session password.
+// Without this, the server's auth-failed / auth-requirement signals were
+// ignored → admin-ble silently failed to identify → BLE triggers were never
+// forwarded. Now we hash the password (via the prompt) + re-identify.
+var sessionPasswordHash = null;
+var password = '';
+
+// sha256 — copied from mc.html. Uses SubtleCrypto when available, falls back
+// to a pure-JS implementation for browsers without SubtleCrypto.
+function sha256Fallback(data) {
+  // Minimal SHA-256 (Ultralight). Adapted from mc.html's identical fallback.
+  function rrot(x, n) { return (x >>> n) | (x << (32 - n)); }
+  var H = new Uint32Array([0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19]);
+  var K = new Uint32Array([0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2]);
+  var bytes = new Uint8Array(data);
+  var len = bytes.length;
+  var bitLen = len * 8;
+  var padLen = (((len + 9) + 63) >> 6) << 6;
+  var padded = new Uint8Array(padLen);
+  padded.set(bytes);
+  padded[len] = 0x80;
+  // High 32 bits of length (we cap at <2^32 bytes so this is always 0).
+  new DataView(padded.buffer).setUint32(padLen - 4, bitLen >>> 0, false);
+  var words = new Uint32Array(padLen / 4);
+  for (var i = 0; i < words.length; i++) {
+    words[i] = (padded[i*4] << 24) | (padded[i*4+1] << 16) | (padded[i*4+2] << 8) | padded[i*4+3];
+  }
+  for (var i = 0; i < words.length; i += 16) {
+    var w = new Uint32Array(64);
+    for (var j = 0; j < 16; j++) w[j] = words[i + j];
+    for (var j = 16; j < 64; j++) {
+      var s0 = rrot(w[j-15],7) ^ rrot(w[j-15],18) ^ (w[j-15] >>> 3);
+      var s1 = rrot(w[j-2],17) ^ rrot(w[j-2],19) ^ (w[j-2] >>> 10);
+      w[j] = (w[j-16] + s0 + w[j-7] + s1) >>> 0;
+    }
+    var a=H[0],b=H[1],c=H[2],d=H[3],e=H[4],f=H[5],g=H[6],h=H[7];
+    for (var j = 0; j < 64; j++) {
+      var S1 = rrot(e,6) ^ rrot(e,11) ^ rrot(e,25);
+      var ch = (e & f) ^ (~e & g);
+      var t1 = (h + S1 + ch + K[j] + w[j]) >>> 0;
+      var S0 = rrot(a,2) ^ rrot(a,13) ^ rrot(a,22);
+      var mj = (a & b) ^ (a & c) ^ (b & c);
+      var t2 = (S0 + mj) >>> 0;
+      h=g; g=f; f=e; e=(d+t1)>>>0; d=c; c=b; b=a; a=(t1+t2)>>>0;
+    }
+    H[0]=(H[0]+a)>>>0; H[1]=(H[1]+b)>>>0; H[2]=(H[2]+c)>>>0; H[3]=(H[3]+d)>>>0;
+    H[4]=(H[4]+e)>>>0; H[5]=(H[5]+f)>>>0; H[6]=(H[6]+g)>>>0; H[7]=(H[7]+h)>>>0;
+  }
+  var hex = '';
+  for (var i = 0; i < 8; i++) {
+    var s = H[i].toString(16);
+    while (s.length < 8) s = '0' + s;
+    hex += s;
+  }
+  return hex;
+}
+
+async function sha256(text) {
+  var encoder = new TextEncoder();
+  var data = encoder.encode(text);
+  if (typeof crypto !== 'undefined' && crypto.subtle) {
+    try {
+      var buf = await crypto.subtle.digest('SHA-256', data);
+      var arr = Array.from(new Uint8Array(buf));
+      return arr.map(function(b){ return b.toString(16).padStart(2, '0'); }).join('');
+    } catch(e) { /* fall through */ }
+  }
+  return sha256Fallback(data);
+}
+
+// BUG #13 fix: show the password prompt UI + submit handler. Mirrors mc.html's
+// showPasswordPrompt / __submitPwd — adapted to admin-ble's #app container.
+function showPasswordPrompt(reason) {
+  var errLine = '';
+  if (reason === 'session_password_required') {
+    errLine = '<p style="color:#fbbf24;font-size:12px;margin-bottom:8px">Password salah, coba lagi.</p>';
+  }
+  document.getElementById('app').innerHTML =
+    '<div class="pwd-box">' +
+    '<div class="icon">\uD83D\uDD11</div>' +
+    '<h2>Password Sesi Diperlukan</h2>' +
+    '<p>Admin telah mengaktifkan password sesi. Masukkan password untuk meneruskan trigger BLE.</p>' +
+    errLine +
+    '<input type="password" id="pwd-input" class="pwd-input" placeholder="Password" autocomplete="current-password" />' +
+    '<button class="pwd-btn" id="pwd-btn" onclick="window.__submitPwd()">CONNECT</button>' +
+    '</div>';
+  var input = document.getElementById('pwd-input');
+  if (input) {
+    input.focus();
+    input.addEventListener('keypress', function(e) {
+      if (e.key === 'Enter') window.__submitPwd();
+    });
+  }
+}
+
+window.__submitPwd = async function() {
+  var input = document.getElementById('pwd-input');
+  var btn = document.getElementById('pwd-btn');
+  if (!input || !input.value) return;
+  password = input.value;
+  if (btn) { btn.disabled = true; btn.textContent = 'Memverifikasi...'; }
+  try {
+    sessionPasswordHash = await sha256(password);
+    bleLog('Password hashed: ' + (sessionPasswordHash || '').slice(0, 8) + '...', 'success');
+  } catch(e) {
+    bleLog('sha256 failed: ' + e.message, 'error');
+    if (btn) { btn.disabled = false; btn.textContent = 'CONNECT'; }
+    return;
+  }
+  if (saSocket && saSocket.connected) {
+    document.getElementById('app').innerHTML = '<div class="info-box">Memverifikasi password...</div>';
+    saSocket.emit('identify', {
+      role: 'admin-ble',
+      channel: 0,
+      sessionPasswordHash: sessionPasswordHash,
+    });
+    setTimeout(function(){ if (btn) { btn.disabled = false; btn.textContent = 'CONNECT'; } }, 3000);
+  } else {
+    document.getElementById('app').innerHTML = '<div class="info-box">Menghubungkan dengan password...</div>';
+  }
+};
 
 function initSocket() {
   try {
@@ -97,9 +219,20 @@ function initSocket() {
       reconnectionDelay: 1000,
       timeout: 5000
     });
-    saSocket.on('connect', function() {
+    saSocket.on('connect', async function() {
       saSocketConnected = true;
-      saSocket.emit('identify', { role: 'admin-ble', channel: 0 });
+      // BUG #13 fix: derive the hash from the cached password (if user already
+      // entered it via the prompt) so reconnects don't lose authentication.
+      if (!sessionPasswordHash && password) {
+        try {
+          sessionPasswordHash = await sha256(password);
+        } catch(e) { /* fall through with null hash */ }
+      }
+      saSocket.emit('identify', {
+        role: 'admin-ble',
+        channel: 0,
+        sessionPasswordHash: sessionPasswordHash,
+      });
       bleLog('Socket.io connected to Electron server', 'success');
     });
     saSocket.on('disconnect', function() {
@@ -108,6 +241,21 @@ function initSocket() {
     });
     saSocket.on('connect_error', function(e) {
       bleLog('Socket.io connect error: ' + e.message, 'error');
+    });
+    // BUG #13 fix: handle auth-failed / auth-requirement so the page can
+    // prompt for the session password + re-identify with the hash.
+    saSocket.on('auth-failed', function(data) {
+      var hadHash = !!sessionPasswordHash;
+      sessionPasswordHash = null;
+      password = '';
+      bleLog('Auth failed: ' + (data && data.reason ? data.reason : 'unknown'), 'warn');
+      showPasswordPrompt(hadHash ? 'session_password_required' : null);
+    });
+    saSocket.on('auth-requirement', function(data) {
+      if (data && data.passwordRequired && !sessionPasswordHash) {
+        bleLog('Server requires session password', 'warn');
+        showPasswordPrompt();
+      }
     });
   } catch(e) {
     bleLog('Socket.io init failed: ' + e.message, 'error');
@@ -386,7 +534,25 @@ function showTroubleshooting() {
   if (tb) tb.style.display = 'block';
 }
 
-var lastTriggerValue = '';
+// BUG #12 fix (audit Remote/Mirror batch 2): dedup on (action, studentId)
+// within an 800ms window instead of exact-string match on the raw payload.
+// Previously `if (value === lastTriggerValue) return; lastTriggerValue = value;`
+// had two failure modes:
+//   1. False-positive dedup: MC legitimately sends the SAME {action, studentId}
+//      twice (user taps NEXT twice because the first tap seemed to not
+//      register, or BLE polling re-reads the characteristic). The exact-string
+//      match blocked the legitimate retry → MC had to wait indefinitely.
+//   2. False-negative dedup: tiny JSON formatting differences (whitespace,
+//      key order) defeated the match → duplicate triggers leaked through.
+// Now we use a (action + ':' + studentId) key with an 800ms expiry window:
+//   - 800ms is long enough to suppress the duplicate that BLE polling
+//     inevitably produces (pollInterval = 1000ms, and the characteristic
+//     still holds the last value, so readValue returns it again on the next
+//     poll → duplicate within ~1000ms).
+//   - 800ms is short enough that a legitimate retry (user taps twice with
+//     > 800ms gap) goes through.
+var lastTriggerByKey = {};
+var DEDUP_WINDOW_MS = 800;
 
 function handleTriggerData(value) {
   try {
@@ -397,9 +563,21 @@ function handleTriggerData(value) {
     // Skip if no action (this is a status update, not a trigger)
     if (!action) return;
 
-    // Dedup: skip if we already processed this exact value
-    if (value === lastTriggerValue) return;
-    lastTriggerValue = value;
+    // BUG #12 fix: dedup on (action, studentId) within 800ms.
+    var key = action + ':' + studentId;
+    var now = Date.now();
+    var lastAt = lastTriggerByKey[key];
+    if (lastAt && (now - lastAt) < DEDUP_WINDOW_MS) {
+      // Duplicate within the window — skip (BLE notification + poll race).
+      return;
+    }
+    lastTriggerByKey[key] = now;
+
+    // Opportunistic cleanup: drop expired entries so the map doesn't grow
+    // unbounded over a long ceremony (4000+ students × 3 actions).
+    for (var k in lastTriggerByKey) {
+      if (now - lastTriggerByKey[k] > 60000) delete lastTriggerByKey[k];
+    }
 
     bleLog('Trigger received: ' + action + (studentId ? ' (' + studentId + ')' : ''), 'success');
 
@@ -409,7 +587,8 @@ function handleTriggerData(value) {
       log.innerHTML += '<br>[' + time + '] ' + action + (studentId ? ' (' + studentId + ')' : '');
     }
 
-    // Forward trigger via BOTH socket.io + HTTP for maximum reliability
+    // Forward trigger via socket.io only (HTTP fallback was removed in batch 1
+    // to fix the BLE_TRIGGER double-fire bug — see comment below).
     if (action === 'PANGGIL' || action === 'NEXT' || action === 'RESET') {
       if (saSocketConnected && saSocket) {
         saSocket.emit('lan-message', {
@@ -418,16 +597,12 @@ function handleTriggerData(value) {
         });
         bleLog('Trigger forwarded via Socket.io: ' + action, 'success');
       }
-      bleLog('Also forwarding via HTTP...', 'warn');
-      fetch('/api/ble-trigger', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: action, studentId: studentId })
-      }).then(function(resp) {
-        bleLog('HTTP trigger OK (' + resp.status + ')', 'success');
-      }).catch(function(e) {
-        bleLog('HTTP trigger failed: ' + e.message, 'error');
-      });
+      // BUG FIX (audit Remote BUG #2): removed HTTP /api/ble-trigger fallback.
+      // Previously the trigger was sent via BOTH socket.io AND HTTP → server
+      // relayed BOTH → admin-dashboard's handleBLETrigger fired TWICE per
+      // trigger. For 'NEXT' this skipped 2 students instead of 1. The
+      // socket.io path is the reliable one (queued when disconnected, auth-
+      // gated). HTTP path had no auth + caused the double-fire.
     }
   } catch(e) {
     // Not JSON or parse error — ignore
@@ -469,8 +644,12 @@ function onDisconnected() {
   isConnected = false;
   if (dataSyncInterval) { clearInterval(dataSyncInterval); dataSyncInterval = null; }
   stopPolling();
-  setStatus('', 'MC terputus. Mencoba reconnect...');
-  setTimeout(connectMC, 3000);
+  // BUG FIX (audit Remote BUG #4): removed misleading "Mencoba reconnect..." text.
+  // navigator.bluetooth.requestDevice (called by connectMC) REQUIRES a user
+  // gesture — a setTimeout callback is NOT a user gesture, so the auto-reconnect
+  // always failed silently. Now we tell the user to click CONNECT manually.
+  setStatus('error', 'MC terputus. Klik CONNECT untuk reconnect.');
+  // Removed: setTimeout(connectMC, 3000); — always fails without user gesture.
 }
 
 // Send status update to MC (e.g., "done" after photo)

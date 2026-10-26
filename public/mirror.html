@@ -1,0 +1,595 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <meta name="saatiril-version" content="v24-mirror-live" />
+  <title>Saatiril Mirror</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body {
+      width: 100%;
+      height: 100%;
+      background: #000;
+      overflow: hidden;
+      font-family: system-ui, -apple-system, 'Segoe UI', sans-serif;
+    }
+    body {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    /* Mirror image — flipped by default so participants see themselves like a
+       real mirror (raise right hand → hand appears on right side of screen).
+       Add ?flip=0 in the URL to disable.
+       Uses object-cover + dynamic aspect-ratio (set via JS from MIRROR_CONFIG)
+       to DUPLICATE the operator's camera zone layout exactly:
+       - Operator: container with config aspect ratio + <video> object-cover
+         (video fills container, crops overflow to config aspect).
+       - Mirror: <video>/<img> with aspect-ratio: <config> + object-cover,
+         centered in the full projector. If projector aspect ≠ config aspect,
+         letterboxing appears (black bars) — but the VIDEO CONTENT is cropped
+         to config aspect, exactly matching what the operator sees.
+       The aspect-ratio is set via inline style by the MIRROR_CONFIG handler.
+       Default (before MIRROR_CONFIG arrives): 4/3 to avoid layout shift. */
+    #mirror-img, #mirror-video {
+      position: absolute;
+      top: 50%; left: 50%;
+      transform: translate(-50%, -50%) scaleX(-1);
+      max-width: 100%;
+      max-height: 100%;
+      width: auto;
+      height: auto;
+      aspect-ratio: 4 / 3;
+      object-fit: cover;
+    }
+    #mirror-img { transition: opacity 150ms ease-out; }
+    #mirror-img.no-flip, #mirror-video.no-flip {
+      transform: translate(-50%, -50%);
+    }
+    #mirror-img.loading { opacity: 0.4; }
+
+    /* Frame overlay — sits ON TOP of the camera, matching its aspect-ratio
+       + object-cover layout so the frame overlaps the camera exactly.
+       Same positioning as #mirror-img/#mirror-video (centered, dynamic
+       aspect-ratio). NOT flipped (frame text must remain readable).
+       Hidden by default until MIRROR_CONFIG arrives with frameData. */
+    #frame-overlay {
+      position: absolute;
+      top: 50%; left: 50%;
+      transform: translate(-50%, -50%);
+      max-width: 100%;
+      max-height: 100%;
+      width: auto;
+      height: auto;
+      aspect-ratio: 4 / 3;
+      object-fit: fill;
+      pointer-events: none;
+      opacity: 0;
+      transition: opacity 200ms ease-out;
+      z-index: 3;
+    }
+    #frame-overlay.show { opacity: 1; }
+
+    /* Big countdown overlay (gold, pulsing) — fades in/out per second. */
+    #countdown {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%) scale(0.9);
+      font-size: 35vmin;
+      font-weight: 900;
+      color: #d4af37;
+      text-shadow:
+        0 0 30px rgba(212, 175, 55, 0.7),
+        0 0 60px rgba(212, 175, 55, 0.5),
+        0 0 100px rgba(212, 175, 55, 0.3);
+      font-family: 'Arial Black', 'Helvetica Neue', system-ui, sans-serif;
+      letter-spacing: -0.05em;
+      pointer-events: none;
+      opacity: 0;
+      transition: opacity 250ms ease-out, transform 250ms ease-out;
+    }
+    #countdown.show {
+      opacity: 1;
+      transform: translate(-50%, -50%) scale(1.1);
+    }
+
+    /* White flash overlay — emitted when operator captures the photo. */
+    #flash {
+      position: fixed;
+      inset: 0;
+      background: #fff;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 220ms ease-out;
+      z-index: 10;
+    }
+    #flash.flash {
+      opacity: 1;
+      transition: none;
+    }
+
+    /* Status badge REMOVED — projector view is clean (no UI clutter).
+       Debug info is still logged to the browser DevTools Console. */
+
+    /* Hint banner — auto-hide after 5s. */
+    #hint {
+      position: absolute;
+      bottom: 16px;
+      left: 50%;
+      transform: translateX(-50%);
+      color: #c4b5fd;
+      font-size: 12px;
+      background: rgba(26, 11, 46, 0.7);
+      padding: 6px 12px;
+      border-radius: 999px;
+      border: 1px solid rgba(83, 52, 133, 0.5);
+      pointer-events: none;
+      transition: opacity 600ms ease-out;
+      z-index: 5;
+    }
+    #hint.hidden { opacity: 0; }
+  </style>
+</head>
+<body>
+  <!-- Native <video> element — used when getUserMedia succeeds (native 30 FPS,
+       no JPEG encoding/transfer). Hidden by default until getUserMedia works. -->
+  <video id="mirror-video" autoplay playsinline muted style="display:none;"></video>
+  <!-- <img> fallback — used when getUserMedia fails (JPEG stream via socket.io/IPC). -->
+  <img id="mirror-img" alt="Live Camera Mirror" class="loading" />
+  <img id="frame-overlay" alt="" />
+  <div id="countdown"></div>
+  <div id="flash"></div>
+  <div id="hint">Klik untuk fullscreen · F fullscreen · M flip mirror</div>
+
+  <script src="/js/socket.io.min.js"></script>
+  <script>
+    (function() {
+      'use strict';
+
+      var params = new URLSearchParams(window.location.search);
+      var channel = parseInt(params.get('channel') || '1', 10) || 1;
+      var flip = params.get('flip') !== '0'; // default: flipped (mirror)
+      var ip = params.get('ip') || window.location.hostname;
+      // socketPort — read from URL (?socketPort=N) for flexibility; default 3003
+      // (matches the Saatiril Electron + Android server default).
+      var SOCKET_PORT = parseInt(params.get('socketPort') || '3003', 10) || 3003;
+
+      var img = document.getElementById('mirror-img');
+      var video = document.getElementById('mirror-video');
+      var frameOverlay = document.getElementById('frame-overlay');
+      var nativeCameraStarted = false;
+      var currentDeviceId = null;   // BUG #3 fix: track current camera device
+      var currentStream = null;     // BUG #3 fix: track current MediaStream for cleanup
+      // BUG #10 (audit-electron-side): track the last applied frameData so we
+      // skip the (expensive) `frameOverlay.src = data.frameData` re-assignment
+      // when the operator's periodic 10s MIRROR_CONFIG re-sends the SAME
+      // frameData (which is the common case after the initial config). Setting
+      // .src to a 500KB-2MB base64 data URL forces the browser to re-decode
+      // the image; over a 4-hour ceremony that's ~1440 redundant decodes.
+      var lastAppliedFrameData = '';
+      var countdown = document.getElementById('countdown');
+      var flash = document.getElementById('flash');
+      var hint = document.getElementById('hint');
+
+      if (!flip) img.classList.add('no-flip');
+
+      // Auto-hide the hint after 5s
+      setTimeout(function() { hint.classList.add('hidden'); }, 5000);
+
+      // Connect to the Saatiril socket.io server. Mirrors the operator.html
+      // connection pattern — CRITICAL: the server uses path: '/' (NOT the
+      // socket.io default '/socket.io/'). Without this option, the polling
+      // request 404s and the mirror page shows a permanent black screen.
+      var isCaddyGateway = window.location.port === '81';
+      var explicitSocketPort = params.get('socketPort');
+      var serverUrl, socketOptions;
+      var commonOpts = {
+        path: '/',
+        transports: ['websocket', 'polling'],
+        upgrade: true,
+        reconnection: true,
+        reconnectionAttempts: Infinity,
+        reconnectionDelay: 500,
+        reconnectionDelayMax: 5000,
+        timeout: 10000,
+      };
+      if (explicitSocketPort) {
+        // Direct to socket.io port (operator's URL includes ?socketPort=N).
+        serverUrl = 'http://' + ip + ':' + explicitSocketPort;
+        socketOptions = Object.assign({}, commonOpts);
+      } else if (isCaddyGateway) {
+        // Via Caddy gateway on port 81 — use XTransformPort query so Caddy
+        // routes the request to the socket.io server port (3003).
+        serverUrl = window.location.origin;
+        socketOptions = Object.assign({}, commonOpts, {
+          query: { XTransformPort: String(SOCKET_PORT) },
+        });
+      } else {
+        // Fallback: direct to default socket.io port.
+        serverUrl = 'http://' + ip + ':' + SOCKET_PORT;
+        socketOptions = Object.assign({}, commonOpts);
+      }
+
+      console.log('[MIRROR] connecting to', serverUrl, 'channel=' + channel, 'flip=' + flip);
+
+      var socket = io(serverUrl, socketOptions);
+
+      // ── Native camera path ──────────────────────────────────────────
+      // Calls getUserMedia with the operator's deviceId → native 30 FPS
+      // video (no JPEG encoding/transfer). Chromium/Electron allows
+      // multiple renderer processes to share the same camera. If this
+      // succeeds, hide the <img> (JPEG stream) + show the <video>. If
+      // it fails (NotReadableError — camera held by another process on
+      // some systems), fall back to the JPEG stream path (the <img>
+      // stays visible + receives MIRROR_FRAME events).
+      function startNativeCamera(deviceId) {
+        // BUG FIX (audit Remote BUG #3): re-acquire camera when deviceId changes.
+        // Previously `if (nativeCameraStarted) return` blocked any re-acquisition
+        // after the first success → if the operator switched cameras mid-event
+        // (USB disconnect, capture card swap), the mirror kept showing the old
+        // camera stream. Now we track the current deviceId + re-start when it
+        // actually changes.
+        if (nativeCameraStarted && currentDeviceId === deviceId && currentStream) {
+          return;  // same camera already running — nothing to do
+        }
+        // Stop the previous stream if any (camera switch).
+        if (currentStream) {
+          try {
+            currentStream.getTracks().forEach(function(t) { t.stop(); });
+          } catch (e) {}
+          currentStream = null;
+        }
+        nativeCameraStarted = true;
+        currentDeviceId = deviceId;
+        console.log('[MIRROR] starting native camera, deviceId=', deviceId);
+        var constraints = {
+          video: { deviceId: { exact: deviceId }, width: { ideal: 1920 }, height: { ideal: 1080 } },
+          audio: false,
+        };
+        navigator.mediaDevices.getUserMedia(constraints).then(function(stream) {
+          currentStream = stream;
+          video.srcObject = stream;
+          video.style.display = '';
+          img.style.display = 'none';  // hide JPEG stream img — native video is live
+          console.log('[MIRROR] native camera started — 30 FPS native video active');
+        }).catch(function(err) {
+          console.warn('[MIRROR] native camera failed, using JPEG stream fallback:', err.name, err.message);
+          // Keep the <img> visible (JPEG stream). Don't show the <video>.
+          nativeCameraStarted = false;  // allow retry on next MIRROR_CONFIG
+          currentDeviceId = null;
+          currentStream = null;
+        });
+      }
+
+      socket.on('connect', function() {
+        console.log('[MIRROR] socket connected:', socket.id, '→ server:', serverUrl);
+        socket.emit('identify', { role: 'mirror', channel: channel });
+        // Ask the operator for a current frame so the mirror isn't black until
+        // the next interval tick.
+        socket.emit('lan-message', { event: 'MIRROR_REQUEST', data: { channel: channel } });
+      });
+
+      socket.on('disconnect', function() {
+        console.log('[MIRROR] socket disconnected');
+      });
+
+      socket.on('connect_error', function(err) {
+        console.warn('[MIRROR] connect_error:', err.message || err);
+      });
+
+      // Frame counter + last-frame timestamp for diagnostics. Logs to console
+      // only (no visual status badge — projector view is clean).
+      var frameCount = 0;
+      var lastFrameAt = 0;
+      // BUG #8 fix (audit Remote/Mirror batch 2): track when the IPC fast path
+      // last set img.src. The socket.io MIRROR_FRAME handler is a backup that
+      // often arrives ~50-150ms AFTER the IPC frame for the same capture (the
+      // operator sends both simultaneously, IPC is faster). Previously the
+      // socket.io handler unconditionally revoked img._lastBlobUrl (which was
+      // the IPC's CURRENT blob URL — still pointed to by img.src) and then
+      // overwrote img.src with an OLDER frame. This caused:
+      //   1. Brief flicker (newer IPC frame replaced by older socket.io frame).
+      //   2. The displayed image's blob URL was revoked before being replaced,
+      //      so for 1 frame the <img> pointed at a revoked blob: URL.
+      // Now the socket.io handler skips its img.src assignment entirely when
+      // IPC set one within the last 100ms — IPC frames always win when both
+      // are flowing, and socket.io only takes over if IPC went silent.
+      var lastIpcFrameAt = 0;
+      var lastFrameCheck = setInterval(function() {
+        if (frameCount > 0 && Date.now() - lastFrameAt > 3000) {
+          // Frames were arriving but stopped — operator likely toggled OFF
+          // or camera went inactive. Log to console only.
+          console.warn('[MIRROR] no frames for 3s — operator may have toggled OFF');
+        }
+      }, 1500);
+
+      // ── IPC fast path for MIRROR_FRAME (Electron mode only) ────────────
+      // If running inside the Electron mirror BrowserWindow (opened via
+      // 'Buka di Projector' button), the operator sends JPEG Blobs directly
+      // via IPC (structured clone — no base64, no JSON, no socket.io). This
+      // is MUCH faster than the socket.io path → smooth on the projector.
+      // Falls back to socket.io MIRROR_FRAME if IPC not available (browser
+      // mode — tablet/phone accessing via URL).
+      var useIpcFrames = !!(window.saatirilAPI && window.saatirilAPI.onMirrorFrame);
+      if (useIpcFrames) {
+        console.log('[MIRROR] IPC fast path available — using direct Blob transfer from operator');
+        window.saatirilAPI.onMirrorFrame(function(blob) {
+          if (blob instanceof Blob && blob.size > 0) {
+            var newSrc = URL.createObjectURL(blob);
+            // Revoke previous blob URL to prevent memory leak.
+            if (img._lastBlobUrl && img._lastBlobUrl.indexOf('blob:') === 0) {
+              try { URL.revokeObjectURL(img._lastBlobUrl); } catch (e) {}
+            }
+            img.src = newSrc;
+            img._lastBlobUrl = newSrc;
+            img.classList.remove('loading');
+            frameCount++;
+            lastFrameAt = Date.now();
+            // BUG #8 fix: mark IPC as the most-recent path so the socket.io
+            // backup handler can defer for the next 100ms.
+            lastIpcFrameAt = lastFrameAt;
+            if (frameCount === 1) {
+              console.log('[MIRROR] first IPC frame: blob size=', blob.size, 'B');
+            }
+          }
+        });
+      } else {
+        console.log('[MIRROR] IPC not available — using socket.io for frames (browser mode)');
+      }
+
+      socket.on('lan-message', function(payload) {
+        if (!payload || !payload.event) return;
+        var data = payload.data || {};
+        // Only handle events for OUR channel (or 'all' — for shared broadcasts).
+        if (data.channel && data.channel !== channel && data.channel !== 'all' && data.channel !== 0) return;
+
+        if (payload.event === 'MIRROR_FRAME') {
+          // Process BOTH IPC + socket.io frames. The IPC path (Blob →
+          // object URL) is faster, but if IPC fails for any reason, the
+          // socket.io path (base64 data URL) is the backup. The img.src
+          // will be set twice per frame (once from IPC, once from socket.io)
+          // — the second one overwrites the first, no harm. This ensures
+          // the mirror NEVER goes black due to IPC failure.
+          //
+          // BUG #8 fix (audit Remote/Mirror batch 2): if IPC just set img.src
+          // within the last 100ms, SKIP this socket.io frame entirely. The
+          // socket.io path arrives ~50-150ms after IPC for the same capture
+          // (operator emits both simultaneously). Without this skip, the
+          // socket.io handler would revoke the IPC's CURRENT blob URL (still
+          // pointed to by img.src) and overwrite img.src with an OLDER frame,
+          // causing a visible flicker + a 1-frame window where img.src points
+          // at a revoked blob: URL. With the skip, IPC frames always win when
+          // both are flowing; socket.io only takes over if IPC went silent.
+          if (data.frame) {
+            if (lastIpcFrameAt && (Date.now() - lastIpcFrameAt) < 100) {
+              // IPC is actively streaming — defer to the faster path. Don't
+              // even decode the base64 / revoke the blob URL.
+              return;
+            }
+            // Operator sends a base64 data URL string (toBlob + FileReader
+            // async on operator side — no main-thread block there). We just
+            // set img.src directly — the browser handles the base64 decode
+            // + JPEG decode + render async. Tried sending binary Blob
+            // through socket.io v4 but it caused black-screen regression
+            // on the mirror side (the Blob wasn't reconstructed correctly
+            // in some setups) — reverted to the proven string path that
+            // worked at commit 1df4732.
+            //
+            // If frame is a Blob (somehow), convert to object URL + revoke
+            // the previous one to prevent memory leak. Otherwise treat as
+            // string (data URL).
+            var newSrc;
+            if (typeof data.frame === 'string') {
+              newSrc = data.frame;
+            } else if (data.frame instanceof Blob) {
+              newSrc = URL.createObjectURL(data.frame);
+            } else if (data.frame && typeof data.frame.size === 'number' && data.frame.size > 0) {
+              // Buffer-like / unknown binary — try wrapping in a Blob.
+              try {
+                newSrc = URL.createObjectURL(new Blob([data.frame], { type: 'image/jpeg' }));
+              } catch (e) {
+                newSrc = null;
+              }
+            }
+            if (newSrc) {
+              // Revoke any previous blob: URL to prevent memory leak.
+              if (img._lastBlobUrl && img._lastBlobUrl.indexOf('blob:') === 0) {
+                try { URL.revokeObjectURL(img._lastBlobUrl); } catch (e) {}
+              }
+              img.src = newSrc;
+              img._lastBlobUrl = (newSrc.indexOf('blob:') === 0) ? newSrc : null;
+              img.classList.remove('loading');
+              frameCount++;
+              lastFrameAt = Date.now();
+              // After first frame, log the type of the first frame for
+              // debugging (helps debug future black-screen regressions).
+              if (frameCount === 1) {
+                // Diagnostic: log the type of the first frame so we can
+                // verify what's actually arriving. Helps debug future
+                // black-screen regressions.
+                var frameType = typeof data.frame;
+                var ctor = data.frame && data.frame.constructor ? data.frame.constructor.name : 'n/a';
+                var sz = (typeof data.frame === 'string')
+                  ? data.frame.length
+                  : (data.frame.size || data.frame.byteLength || 0);
+                console.log('[MIRROR] first frame type=' + frameType + ' ctor=' + ctor + ' size=' + sz + 'B');
+              }
+            }
+          }
+          return;
+        }
+
+        // MIRROR_CONFIG — sent ONCE when the operator's cssFilter or
+        // frameData changes (or in response to our MIRROR_REQUEST on
+        // connect). Applies the project's CSS filter (e.g. grayscale
+        // for B&W) + frame overlay to the mirror view via CSS
+        // (GPU-accelerated, no per-frame CPU cost). The MIRROR_FRAME
+        // wire payload stays minimal — just the raw JPEG.
+        if (payload.event === 'MIRROR_CONFIG') {
+          // Apply the CSS filter to BOTH the <img> (JPEG fallback) and the
+          // <video> (native camera path). GPU-accelerated, no per-frame CPU.
+          if (typeof data.cssFilter === 'string' && data.cssFilter !== 'none') {
+            img.style.filter = data.cssFilter;
+            video.style.filter = data.cssFilter;
+            console.log('[MIRROR] applied cssFilter:', data.cssFilter);
+          } else {
+            img.style.filter = '';
+            video.style.filter = '';
+          }
+          // Apply the aspect ratio to video + img + frame overlay. This
+          // DUPLICATES the operator's camera zone layout: the video is
+          // cropped to the config aspect ratio (object-cover) + centered
+          // in the full projector. If projector aspect ≠ config aspect,
+          // letterboxing appears (black bars) — but the VIDEO CONTENT is
+          // cropped exactly like the operator sees it.
+          if (typeof data.aspectRatio === 'number' && data.aspectRatio > 0) {
+            var aspectCss = data.aspectRatio;  // e.g. 1.3333 for 4:3
+            img.style.aspectRatio = aspectCss;
+            video.style.aspectRatio = aspectCss;
+            frameOverlay.style.aspectRatio = aspectCss;
+            console.log('[MIRROR] applied aspectRatio:', aspectCss);
+          }
+          // Apply the frame overlay.
+          // BUG #10 (audit-electron-side): skip the .src re-assignment if the
+          // frameData is unchanged since the last MIRROR_CONFIG. The operator
+          // re-emits MIRROR_CONFIG every 10s (periodic) regardless of whether
+          // frameData changed — re-setting .src forces a redundant image
+          // decode (500KB-2MB) each time, causing CPU/memory pressure on
+          // low-power projector devices. We compare against the last applied
+          // value + only write .src when it actually changed.
+          if (typeof data.frameData === 'string' && data.frameData.length > 0) {
+            if (data.frameData !== lastAppliedFrameData) {
+              frameOverlay.src = data.frameData;
+              lastAppliedFrameData = data.frameData;
+              console.log('[MIRROR] applied frame overlay, size=', Math.round(data.frameData.length / 1024) + 'KB');
+            }
+            frameOverlay.classList.add('show');
+          } else {
+            frameOverlay.classList.remove('show');
+            frameOverlay.removeAttribute('src');
+            lastAppliedFrameData = '';
+          }
+          // Apply the mirror (flip) setting to both img + video.
+          if (data.mirror === false) {
+            img.classList.add('no-flip');
+            video.classList.add('no-flip');
+          } else {
+            img.classList.remove('no-flip');
+            video.classList.remove('no-flip');
+          }
+          // ── NATIVE CAMERA PATH ──────────────────────────────────────
+          // Try getUserMedia with the operator's deviceId → native 30 FPS
+          // video (no JPEG encoding/transfer). Chromium/Electron allows
+          // multiple renderer processes to share the same camera. If this
+          // succeeds, hide the <img> (JPEG stream) + show the <video>.
+          // If it fails (NotReadableError — camera already held by another
+          // process on some systems), fall back to the JPEG stream path.
+          if (data.deviceId && !nativeCameraStarted) {
+            startNativeCamera(data.deviceId);
+          }
+          return;
+        }
+
+        // Log non-frame events for debugging (countdown / capture / clear).
+        console.log('[MIRROR] event:', payload.event, 'data:', data);
+
+        switch (payload.event) {
+          case 'MIRROR_COUNTDOWN':
+            var secs = data.seconds;
+            if (typeof secs !== 'number') break;
+            if (secs <= 0) {
+              countdown.classList.remove('show');
+              setTimeout(function() { countdown.textContent = ''; }, 300);
+            } else {
+              countdown.textContent = String(secs);
+              // Force reflow so the .show transition restarts (pulse per second).
+              void countdown.offsetWidth;
+              countdown.classList.add('show');
+              // Hide slightly before the next tick to make the pulse visible.
+              setTimeout(function() { countdown.classList.remove('show'); }, 700);
+            }
+            break;
+
+          case 'MIRROR_CAPTURE':
+            // White flash overlay (matches operator's flash duration).
+            flash.classList.add('flash');
+            setTimeout(function() { flash.classList.remove('flash'); }, 90);
+            break;
+
+          case 'MIRROR_CLEAR':
+            // Revoke any pending blob URL before clearing src.
+            if (img._lastBlobUrl) {
+              try { URL.revokeObjectURL(img._lastBlobUrl); } catch (e) {}
+              img._lastBlobUrl = null;
+            }
+            img.classList.add('loading');
+            img.removeAttribute('src');
+            countdown.classList.remove('show');
+            setTimeout(function() { countdown.textContent = ''; }, 300);
+            break;
+        }
+      });
+
+      // ── Cleanup blob URL on page unload (prevent memory leak) ─────────────
+      // BUG #14 fix (audit Remote/Mirror batch 2): also clear the watchdog
+      // interval (lastFrameCheck) + stop the native camera stream (if any)
+      // on beforeunload. Previously the 1.5s interval kept firing after the
+      // page was closed → zombie timer in some embedded projector browsers
+      // (Raspberry Pi, kiosk-mode Chromium) that don't immediately tear down
+      // the JS context on page close. Also the native camera stream stayed
+      // held (NotReadableError for the next page that tried to use it).
+      window.addEventListener('beforeunload', function() {
+        if (lastFrameCheck) {
+          try { clearInterval(lastFrameCheck); } catch (e) {}
+          lastFrameCheck = null;
+        }
+        if (currentStream) {
+          try {
+            currentStream.getTracks().forEach(function(t) { t.stop(); });
+          } catch (e) {}
+          currentStream = null;
+        }
+        if (img._lastBlobUrl) {
+          try { URL.revokeObjectURL(img._lastBlobUrl); } catch (e) {}
+          img._lastBlobUrl = null;
+        }
+        if (socket) socket.disconnect();
+      });
+
+      // ── Fullscreen toggle (click anywhere) ──────────────────────────────────
+      document.addEventListener('click', function() {
+        if (!document.fullscreenElement) {
+          var req = document.documentElement.requestFullscreen ||
+                     document.documentElement.webkitRequestFullscreen;
+          if (req) req.call(document.documentElement);
+        }
+      });
+
+      // ── Keyboard shortcuts ──────────────────────────────────────────────────
+      document.addEventListener('keydown', function(e) {
+        if (e.key === 'f' || e.key === 'F') {
+          if (!document.fullscreenElement) {
+            var req = document.documentElement.requestFullscreen ||
+                       document.documentElement.webkitRequestFullscreen;
+            if (req) req.call(document.documentElement);
+          } else {
+            var exit = document.exitFullscreen || document.webkitExitFullscreen;
+            if (exit) exit.call(document);
+          }
+        } else if (e.key === 'm' || e.key === 'M') {
+          img.classList.toggle('no-flip');
+          flip = !img.classList.contains('no-flip');
+          console.log('[MIRROR] mirror flip:', flip);
+        } else if (e.key === 'Escape') {
+          if (document.fullscreenElement) {
+            var ex = document.exitFullscreen || document.webkitExitFullscreen;
+            if (ex) ex.call(document);
+          }
+        }
+      });
+    })();
+  </script>
+</body>
+</html>

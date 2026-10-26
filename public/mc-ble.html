@@ -145,8 +145,12 @@ async function connectBLE() {
 function onDisconnected() {
   isConnected = false;
   setStatus('');
-  document.getElementById('app').innerHTML = '<div class="error-box">Koneksi Bluetooth terputus. Mencoba reconnect...</div>';
-  setTimeout(connectBLE, 3000);
+  // BUG FIX (audit Remote BUG #4): removed misleading "Mencoba reconnect..." text.
+  // navigator.bluetooth.requestDevice (called by connectBLE) REQUIRES a user
+  // gesture — a setTimeout callback is NOT a user gesture, so the auto-reconnect
+  // always failed silently. Now we tell the user to click CONNECT manually.
+  document.getElementById('app').innerHTML = '<div class="error-box">Koneksi Bluetooth terputus. Klik CONNECT untuk reconnect.</div>';
+  // Removed: setTimeout(connectBLE, 3000); — always fails without user gesture.
 }
 
 function onNextStudentChanged(event) {

@@ -6,7 +6,7 @@ import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
 import { ScrollArea } from '@/components/ui/scroll-area'
-import { Megaphone, Users, Clock, CheckCircle2, Loader2, Camera, Search, Send, RotateCcw, ArrowRight } from 'lucide-react'
+import { Megaphone, Users, Clock, CheckCircle2, Loader2, Camera, Search, Send, RotateCcw, ArrowRight, CheckSquare, Square, ListChecks, X } from 'lucide-react'
 import { useSaatirilStore, type Student, type StudentStatus, type PhotoHistoryItem, type CameraMode, mergeDatabases, stripFrameForSync, preserveFrameOnSync, preservePhotoHistoryOnSync, mergeCaptureVersions, isPhotoshootMode, isDualPhotoshootMode, channelCount } from '@/store/use-saatiril-store'
 import { emitLocal, onLocal, offLocal } from '@/lib/socket'
 import { useIsMobile } from '@/hooks/use-mobile'
@@ -99,6 +99,13 @@ export function McPanel({ compact = false, channel }: { compact?: boolean; chann
   const [selesaiSearchQuery, setSelesaiSearchQuery] = useState('')
   const [monitorLocked, setMonitorLocked] = useState(false)
   const [selectedStudent, setSelectedStudent] = useState<Student | null>(null)
+  // ── Multi-select for photoshoot mode (single + dual) ─────────────────────────
+  // Allows MC to select more than one (or all) pending students and send
+  // them to the operator(s) in a single batch. Each selected student is
+  // marked 'sent' + emitted as MC_CALL; the operator's existing queue UI
+  // (opQueue in operator-panel.tsx) already handles a list of 'sent'
+  // students — the operator clicks whichever to photograph next.
+  const [selectedStudentIds, setSelectedStudentIds] = useState<string[]>([])
   // ── Mobile/compact: active tab for the 3-section workspace ────────────────
   const [activeTab, setActiveTab] = useState<'antrean' | 'proses' | 'selesai'>('antrean')
 
@@ -312,14 +319,18 @@ export function McPanel({ compact = false, channel }: { compact?: boolean; chann
         newHistory = [...curProj.photoHistory, historyItem]
       }
 
-      // Check completion: in dual-photoshoot mode, EITHER camera is sufficient
-      // (the participant is considered done after 1 of the 2 cameras takes a photo).
-      // In single-photoshoot mode, the single channel is sufficient.
+      // Check completion: in dual-photoshoot mode, BOTH cameras must photograph
+      // (the participant is done only after channel 1 AND channel 2 each have
+      // a photoHistory entry with photos). In single-photoshoot mode, the
+      // single channel is sufficient.
+      // (matches Android AdminViewModel.handlePhotosSaved after fix in d07fdeb —
+      // the old `||` marked done after either channel, causing the second
+      // channel operator to skip the student and miss the second photo.)
       let allChannelsDone = true
       if (isDualPhotoshootMode(curProj.config.mode)) {
-        const ch1Done = newHistory.some((h) => h.student.id === data.student.id && h.channel === 1)
-        const ch2Done = newHistory.some((h) => h.student.id === data.student.id && h.channel === 2)
-        allChannelsDone = ch1Done || ch2Done
+        const ch1Done = newHistory.some((h) => h.student.id === data.student.id && h.channel === 1 && h.photos.length > 0)
+        const ch2Done = newHistory.some((h) => h.student.id === data.student.id && h.channel === 2 && h.photos.length > 0)
+        allChannelsDone = ch1Done && ch2Done
       } else {
         // Single-photoshoot: one channel is enough
         allChannelsDone = true
@@ -478,6 +489,118 @@ export function McPanel({ compact = false, channel }: { compact?: boolean; chann
     setSelectedStudent(null)
   }, [selectedStudent, currentProject, dualPhotoshoot, updateStudentStatus, updateCurrentProject, saveProjectsToStorageNow])
 
+  // ── Photoshoot: multi-select helpers ─────────────────────────────────────
+  // Toggle a student in/out of the multi-select set (preserves order so the
+  // batch send emits MC_CALLs in selection order, matching operator queue).
+  const toggleStudentSelection = useCallback((id: string) => {
+    setSelectedStudentIds((prev) =>
+      prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]
+    )
+  }, [])
+
+  // Select all currently-displayed pending students (respects the search
+  // filter — if MC filtered to e.g. "toga", only those get selected).
+  const selectAllDisplayed = useCallback(() => {
+    setSelectedStudentIds((prev) => {
+      const seen = new Set(prev)
+      // Append displayed IDs that aren't already selected (so calling this
+      // multiple times with different search filters accumulates the
+      // selection rather than replacing it).
+      const merged = [...prev]
+      for (const s of displayedAntrean) {
+        if (!seen.has(s.id)) {
+          merged.push(s.id)
+          seen.add(s.id)
+        }
+      }
+      return merged
+    })
+  }, [displayedAntrean])
+
+  // Deselect all currently-displayed (respects search filter — only removes
+  // the ones currently visible so MC can prune part of a big selection).
+  const deselectAllDisplayed = useCallback(() => {
+    setSelectedStudentIds((prev) => {
+      const displayedIds = new Set(displayedAntrean.map((s) => s.id))
+      return prev.filter((id) => !displayedIds.has(id))
+    })
+  }, [displayedAntrean])
+
+  const clearSelection = useCallback(() => {
+    setSelectedStudentIds([])
+  }, [])
+
+  // Resolve the selected IDs to actual Student objects (filter out any that
+  // are no longer 'pending' — e.g. already sent in a previous batch).
+  const selectedStudents = useMemo<Student[]>(() => {
+    if (!currentProject) return []
+    const db = currentProject.database
+    const result: Student[] = []
+    for (const id of selectedStudentIds) {
+      const s = db.find((x) => x.id === id)
+      if (s && s.status === 'pending') result.push(s)
+    }
+    return result
+  }, [selectedStudentIds, currentProject])
+
+  // ── Photoshoot: send ALL selected students to operator(s) in one batch ──
+  // For each selected student: mark 'sent' + emit MC_CALL (to both channels
+  // in dual mode, to channel 1 only in single mode). The operator's existing
+  // opQueue UI (operator-panel.tsx) lists every 'sent' student — the operator
+  // clicks whichever to photograph next. SYNC_DB is emitted ONCE at the end
+  // (lightweight — photos are stripped) instead of N times.
+  const handleSendBatchToOperator = useCallback(() => {
+    if (selectedStudents.length === 0 || !currentProject) return
+
+    const newStatus: StudentStatus = 'sent'
+    const selectedIdSet = new Set(selectedStudents.map((s) => s.id))
+
+    const latestProject = useSaatirilStore.getState().currentProject
+    if (!latestProject) return
+
+    // Single pass: mark all selected as 'sent' in the project DB.
+    const updatedProject = {
+      ...latestProject,
+      database: latestProject.database.map((s) =>
+        selectedIdSet.has(s.id) ? { ...s, status: newStatus } : s
+      ),
+    }
+
+    selectedStudents.forEach((s) => updateStudentStatus(s.id, newStatus))
+    updateCurrentProject(updatedProject)
+    saveProjectsToStorageNow()
+
+    // Emit MC_CALL for each selected student. Order matters in dual mode
+    // (both channels must see the same student before the next).
+    if (dualPhotoshoot) {
+      for (const student of selectedStudents) {
+        emitLocal('MC_CALL', {
+          student: { ...student, status: newStatus, assignedChannel: 1 },
+          channel: 1,
+        })
+        emitLocal('MC_CALL', {
+          student: { ...student, status: newStatus, assignedChannel: 2 },
+          channel: 2,
+        })
+      }
+    } else {
+      // Single photoshoot: channel 1 only
+      for (const student of selectedStudents) {
+        emitLocal('MC_CALL', {
+          student: { ...student, status: newStatus },
+          channel: 1,
+        })
+      }
+    }
+
+    // Lightweight SYNC_DB once at the end (photos stripped — see
+    // use-saatiril-store.ts stripFrameForSync).
+    emitLocal('SYNC_DB', { project: stripFrameForSync(updatedProject) })
+
+    setSearchQuery('')
+    setSelectedStudentIds([])
+  }, [selectedStudents, currentProject, dualPhotoshoot, updateStudentStatus, updateCurrentProject, saveProjectsToStorageNow])
+
   // ── Photoshoot: reset (for retake)
   // Clears the student's photoHistory + resets status to 'pending' + emits a
   // dedicated STUDENT_RESET event so operators (and admin) explicitly clear
@@ -554,18 +677,20 @@ export function McPanel({ compact = false, channel }: { compact?: boolean; chann
       }
       return (
         <Button
-          disabled={!selectedStudent}
-          onClick={handleSendToOperator}
+          disabled={selectedStudents.length === 0}
+          onClick={handleSendBatchToOperator}
           className={`w-full font-bold cursor-pointer transition-all duration-200 active:scale-[0.98] ${isMobile ? 'h-14 text-base' : compact ? 'h-9 text-xs hover:scale-[1.02]' : 'h-14 text-lg hover:scale-[1.02]'}`}
           style={{
-            backgroundColor: selectedStudent ? THEME.emerald : THEME.panel,
-            color: selectedStudent ? THEME.bg : THEME.muted,
-            border: `2px solid ${selectedStudent ? THEME.emerald : THEME.border}`,
-            boxShadow: selectedStudent ? `0 0 20px ${THEME.emerald}44` : 'none',
+            backgroundColor: selectedStudents.length > 0 ? THEME.emerald : THEME.panel,
+            color: selectedStudents.length > 0 ? THEME.bg : THEME.muted,
+            border: `2px solid ${selectedStudents.length > 0 ? THEME.emerald : THEME.border}`,
+            boxShadow: selectedStudents.length > 0 ? `0 0 20px ${THEME.emerald}44` : 'none',
           }}
         >
           <Send className={compact ? 'size-3' : 'size-4'} />
-          {dualPhotoshoot ? 'KIRIM KE 2 KAMERA' : 'KIRIM KE OPERATOR'}
+          {selectedStudents.length > 0
+            ? (dualPhotoshoot ? `KIRIM ${selectedStudents.length} KE 2 KAMERA` : `KIRIM ${selectedStudents.length} KE OPERATOR`)
+            : (dualPhotoshoot ? 'PILIH PESERTA DULU' : 'PILIH PESERTA DULU')}
         </Button>
       )
     }
@@ -916,6 +1041,40 @@ export function McPanel({ compact = false, channel }: { compact?: boolean; chann
           </div>
         )}
 
+        {/* Multi-select toolbar (photoshoot only) — Pilih Semua / Kosongkan / counter */}
+        {photoshoot && (
+          <div
+            className={`shrink-0 flex items-center justify-between gap-2 ${isCompact ? 'px-2 py-1' : 'px-3 py-1.5'}`}
+            style={{ borderBottom: `1px solid ${THEME.border}`, backgroundColor: THEME.panel }}
+          >
+            <div className="flex items-center gap-1.5 min-w-0">
+              <button
+                type="button"
+                onClick={selectAllDisplayed}
+                disabled={displayedAntrean.length === 0}
+                className={`flex items-center gap-1 rounded font-medium transition-colors hover:bg-white/5 disabled:opacity-50 disabled:cursor-not-allowed ${isCompact ? 'text-[9px] px-1.5 py-0.5' : 'text-[10px] px-2 py-1'}`}
+                style={{ color: THEME.emerald, border: `1px solid ${THEME.emerald}44` }}
+              >
+                <ListChecks className={isCompact ? 'size-2.5' : 'size-3'} />
+                Pilih Semua
+              </button>
+              <button
+                type="button"
+                onClick={deselectAllDisplayed}
+                disabled={selectedStudents.length === 0}
+                className={`flex items-center gap-1 rounded font-medium transition-colors hover:bg-white/5 disabled:opacity-50 disabled:cursor-not-allowed ${isCompact ? 'text-[9px] px-1.5 py-0.5' : 'text-[10px] px-2 py-1'}`}
+                style={{ color: THEME.muted, border: `1px solid ${THEME.border}` }}
+              >
+                <X className={isCompact ? 'size-2.5' : 'size-3'} />
+                Kosongkan
+              </button>
+            </div>
+            <span className={`font-bold shrink-0 ${isCompact ? 'text-[9px]' : 'text-[10px]'}`} style={{ color: selectedStudents.length > 0 ? THEME.emerald : THEME.muted }}>
+              {selectedStudents.length} terpilih
+            </span>
+          </div>
+        )}
+
         {/* List */}
         <ScrollArea className="flex-1 min-h-0">
           <div className="flex flex-col">
@@ -928,7 +1087,7 @@ export function McPanel({ compact = false, channel }: { compact?: boolean; chann
             ) : (
               displayedAntrean.map((student, idx) => {
                 const isNext = !photoshoot && student.id === nextPending?.id
-                const isSelected = photoshoot && selectedStudent?.id === student.id
+                const isSelected = photoshoot && selectedStudentIds.includes(student.id)
                 return (
                   <div
                     key={student.id}
@@ -939,8 +1098,7 @@ export function McPanel({ compact = false, channel }: { compact?: boolean; chann
                     style={getRowStyle(student)}
                     onClick={() => {
                       if (photoshoot) {
-                        setSelectedStudent(student)
-                        setSearchQuery(student.nama)
+                        toggleStudentSelection(student.id)
                       }
                     }}
                   >
@@ -959,7 +1117,11 @@ export function McPanel({ compact = false, channel }: { compact?: boolean; chann
                       {student.nama}
                     </span>
                     {photoshoot ? (
-                      <ArrowRight className={`shrink-0 ${isCompact ? 'size-3' : 'size-3.5'}`} style={{ color: isSelected ? THEME.emerald : THEME.muted }} />
+                      isSelected ? (
+                        <CheckSquare className={`shrink-0 ${isCompact ? 'size-3' : 'size-3.5'}`} style={{ color: THEME.emerald }} />
+                      ) : (
+                        <Square className={`shrink-0 ${isCompact ? 'size-3' : 'size-3.5'}`} style={{ color: THEME.muted }} />
+                      )
                     ) : isNext ? (
                       <Megaphone className={`shrink-0 ${isCompact ? 'size-3' : 'size-3.5'}`} style={{ color: THEME.gold }} />
                     ) : null}
@@ -975,8 +1137,8 @@ export function McPanel({ compact = false, channel }: { compact?: boolean; chann
           className={`shrink-0 ${isCompact ? 'p-1.5' : 'p-3'}`}
           style={{ borderTop: `1px solid ${THEME.border}`, backgroundColor: THEME.panel }}
         >
-          {/* Selected student preview (photoshoot only, not done) */}
-          {photoshoot && selectedStudent && selectedStudent.status !== 'done' && (
+          {/* Selected students preview (photoshoot only, not done) */}
+          {photoshoot && selectedStudent && selectedStudent.status !== 'done' && selectedStudents.length === 0 && (
             <div
               className={`rounded-md mb-2 min-w-0 ${isCompact ? 'p-1.5' : 'p-2'}`}
               style={{ backgroundColor: `${THEME.emerald}15`, border: `1px solid ${THEME.emerald}33` }}
@@ -990,6 +1152,27 @@ export function McPanel({ compact = false, channel }: { compact?: boolean; chann
               <p className={`font-mono truncate ${isCompact ? 'text-[9px]' : 'text-[10px]'}`} style={{ color: THEME.muted }}>
                 {selectedStudent.nim}
               </p>
+            </div>
+          )}
+          {/* Multi-select preview (photoshoot only) — shows count + first 3 names */}
+          {photoshoot && selectedStudents.length > 0 && (
+            <div
+              className={`rounded-md mb-2 min-w-0 ${isCompact ? 'p-1.5' : 'p-2'}`}
+              style={{ backgroundColor: `${THEME.emerald}15`, border: `1px solid ${THEME.emerald}33` }}
+            >
+              <p className={`font-semibold uppercase tracking-wider truncate ${isCompact ? 'text-[8px]' : 'text-[10px]'}`} style={{ color: THEME.emerald }}>
+                {selectedStudents.length} Peserta Dipilih
+              </p>
+              {selectedStudents.slice(0, 3).map((s) => (
+                <p key={s.id} className={`font-bold truncate ${isCompact ? 'text-[10px]' : 'text-xs'}`} style={{ color: '#ffffff' }}>
+                  {s.nama}
+                </p>
+              ))}
+              {selectedStudents.length > 3 && (
+                <p className={`font-medium italic ${isCompact ? 'text-[9px]' : 'text-[10px]'}`} style={{ color: THEME.muted }}>
+                  +{selectedStudents.length - 3} lainnya
+                </p>
+              )}
             </div>
           )}
           {/* When the selected student is already 'done', redirect reset to SELESAI column */}

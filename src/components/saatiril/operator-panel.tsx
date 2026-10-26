@@ -43,6 +43,11 @@ import {
   Grid3x3,
   Maximize,
   Minimize,
+  Cast,
+  Copy,
+  Check,
+  Monitor,
+  PowerOff,
 } from 'lucide-react'
 import {
   useSaatirilStore,
@@ -59,7 +64,7 @@ import {
   isDualPhotoshootMode,
   channelCount,
 } from '@/store/use-saatiril-store'
-import { emitLocal, onLocal, offLocal } from '@/lib/socket'
+import { emitLocal, onLocal, offLocal, getSocket } from '@/lib/socket'
 import { useIsMobile } from '@/hooks/use-mobile'
 import { useAIDetection, type AIMomentEvent } from '@/hooks/use-ai-detection'
 import { usePalmDetection } from '@/hooks/use-palm-detection'
@@ -128,12 +133,32 @@ function parseRatio(ratioStr: string): number {
 // ─── Helpers ────────────────────────────────────────────────────────────────
 // DEFENSIVE: nama/nim can be undefined if a photoHistory entry got corrupted
 // during reset+retake cycles. Never let .trim() crash the whole app.
+// (matches Android FilenameUtils.kt after fix in d07fdeb — sanitize + cap
+//  nama at 40 chars and fall back to studentId → clock-hex when both sanitize
+//  empty so empty Excel rows no longer collide on filenames like "___1_Toga.jpg".)
+const MAX_NAMA_LENGTH = 40
+
 function sanitizeNama(nama: string | undefined | null): string {
-  return (nama ?? '').trim().replace(/\s+/g, '_').replace(/[^a-zA-Z0-9_]/g, '')
+  return (nama ?? '').trim().replace(/\s+/g, '_').replace(/[^a-zA-Z0-9_]/g, '').slice(0, MAX_NAMA_LENGTH)
 }
 
 function sanitizeNim(nim: string | undefined | null): string {
   return (nim ?? '').toString().trim().replace(/[^a-zA-Z0-9_-]/g, '')
+}
+
+/** Build the "NIM_Nama" identity part of a filename.
+ *  - both present → "NIM_Nama"
+ *  - only one present → that part alone (no dangling "_")
+ *  - both empty → first 8 chars of studentId, else a clock-derived hex.
+ */
+function buildIdentityPart(nim: string | undefined, nama: string | undefined, studentId?: string): string {
+  const nimPart = sanitizeNim(nim)
+  const namaPart = sanitizeNama(nama)
+  if (nimPart && namaPart) return `${nimPart}_${namaPart}`
+  if (nimPart) return nimPart
+  if (namaPart) return namaPart
+  const idPart = sanitizeNim(studentId).slice(0, 8)
+  return idPart || Date.now().toString(16).slice(-8)
 }
 
 /**
@@ -142,8 +167,8 @@ function sanitizeNim(nim: string | undefined | null): string {
  * v1 → `NIM_Nama_1_Toga.jpg` (no version suffix for backwards compat)
  * v2 → `NIM_Nama_1_Toga_v2.jpg`, v3 → `..._v3.jpg`, …
  */
-function buildFilename(nim: string | undefined, nama: string | undefined, suffix: number, type: string, version: number = 1): string {
-  const base = `${sanitizeNim(nim)}_${sanitizeNama(nama)}_${suffix}_${type}`
+function buildFilename(nim: string | undefined, nama: string | undefined, suffix: number, type: string, version: number = 1, studentId?: string): string {
+  const base = `${buildIdentityPart(nim, nama, studentId)}_${suffix}_${type}`
   return version > 1 ? `${base}_v${version}.jpg` : `${base}.jpg`
 }
 
@@ -153,8 +178,8 @@ function buildFilename(nim: string | undefined, nama: string | undefined, suffix
  * v1 → `NIM_Nama.jpg` or `NIM_Nama_Ch2.jpg` (no version suffix)
  * v2 → `NIM_Nama_v2.jpg` or `NIM_Nama_Ch2_v2.jpg`, …
  */
-function buildPhotoshootFilename(nim: string | undefined, nama: string | undefined, channel: number, version: number = 1): string {
-  const base = `${sanitizeNim(nim)}_${sanitizeNama(nama)}`
+function buildPhotoshootFilename(nim: string | undefined, nama: string | undefined, channel: number, version: number = 1, studentId?: string): string {
+  const base = buildIdentityPart(nim, nama, studentId)
   const withCh = channel > 1 ? `${base}_Ch${channel}` : base
   return version > 1 ? `${withCh}_v${version}.jpg` : `${withCh}.jpg`
 }
@@ -346,6 +371,284 @@ export function OperatorPanel({ isAppFullscreen = false, onToggleAppFullscreen, 
   // in handleCapture uses the un-mirrored video frame (so photos are saved
   // correctly oriented).
   const [mirror, setMirror] = useState(false)
+  // ── Live Mirror (broadcast camera to /mirror display) ──────────────────
+  // When ON, the operator's camera frames are streamed at ~10 FPS to the
+  // /mirror page (opened on a separate device or 2nd monitor) so participants
+  // can see themselves (mirror) + countdown + flash without disturbing the
+  // operator's panel. Emits lan-message events MIRROR_FRAME / MIRROR_COUNTDOWN
+  // / MIRROR_CAPTURE on this channel — the /mirror page filters by channel.
+  const [liveMirror, setLiveMirror] = useState(false)
+  const mirrorIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const liveMirrorChannelRef = useRef(myChannel)
+  useEffect(() => { liveMirrorChannelRef.current = myChannel }, [myChannel])
+  // Ref mirror of liveMirror so finalizeCapture (which has a useCallback with
+  // a fixed deps array) can read the current value without going stale.
+  const liveMirrorRef = useRef(false)
+  useEffect(() => { liveMirrorRef.current = liveMirror }, [liveMirror])
+
+  // ── LAN info (Electron IPC) + mirror URL state ─────────────────────────
+  // When Live Mirror is ON, we build a copy-paste-ready URL with the laptop's
+  // LAN IP so the operator can hand it to participants without manually
+  // figuring out the IP. Falls back to window.location.hostname in browser
+  // mode (non-Electron).
+  const [lanInfo, setLanInfo] = useState<{ httpPort: number; socketPort: number; ips: { name: string; address: string }[] } | null>(null)
+  const [mirrorUrl, setMirrorUrl] = useState<string>('')
+  const [mirrorCopied, setMirrorCopied] = useState(false)
+
+  useEffect(() => {
+    const api = window.saatirilAPI
+    if (api?.isElectron && api.getLanInfo) {
+      api.getLanInfo().then((info: any) => {
+        setLanInfo(info)
+        console.log('[SAATIRIL OP] LAN info for mirror:', info)
+      }).catch(() => {})
+    }
+  }, [])
+
+  // Build the /mirror URL based on LAN info (or fallback to window.location).
+  // Returns the full URL string including channel + socketPort query params.
+  const buildMirrorUrl = useCallback(async () => {
+    const api = window.saatirilAPI
+    const isElectron = api?.isElectron
+    const path = `/mirror`
+    const channelParam = `channel=${myChannel}`
+
+    if (isElectron) {
+      try {
+        const info = lanInfo || (await api.getLanInfo())
+        const ips = info.ips
+        const lanIP = ips.length > 0 ? ips[0].address : 'localhost'
+        const url = `http://${lanIP}:${info.httpPort}${path}?${channelParam}&socketPort=${info.socketPort}`
+        return url
+      } catch {
+        const hostname = window.location.hostname || 'localhost'
+        const params = new URLSearchParams(window.location.search)
+        const socketPort = params.get('socketPort') || '3003'
+        return `http://${hostname}:81${path}?${channelParam}&socketPort=${socketPort}`
+      }
+    } else {
+      // Browser mode — use window.location.origin (or detect LAN IP via WebRTC
+      // if on localhost, mirrors the admin-dashboard.tsx copyLink pattern).
+      const socketPort = new URLSearchParams(window.location.search).get('socketPort') || '3003'
+      let origin = window.location.origin
+      const hostname = window.location.hostname
+      if (hostname === 'localhost' || hostname === '127.0.0.1') {
+        try {
+          const pc = new RTCPeerConnection({ iceServers: [] })
+          pc.createDataChannel('')
+          const offer = await pc.createOffer()
+          await pc.setLocalDescription(offer)
+          const lanIP = await new Promise<string | null>((resolve) => {
+            const timeout = setTimeout(() => { pc.close(); resolve(null) }, 3000)
+            pc.onicecandidate = (e) => {
+              if (!e.candidate) return
+              const parts = e.candidate.candidate.split(' ')
+              const ip = parts[4]
+              if (ip && /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(ip) && !ip.startsWith('0.') && ip !== '0.0.0.0') {
+                clearTimeout(timeout)
+                pc.close()
+                resolve(ip)
+              }
+            }
+          })
+          if (lanIP) {
+            const port = window.location.port || '81'
+            origin = `http://${lanIP}:${port}`
+          }
+        } catch {
+          // WebRTC not available — keep localhost URL
+        }
+      }
+      return `${origin}${path}?${channelParam}&socketPort=${socketPort}`
+    }
+  }, [lanInfo, myChannel])
+
+  // Rebuild the URL whenever Live Mirror is toggled ON, channel changes, or
+  // LAN info arrives (Electron IPC is async — lanInfo may load after the
+  // initial toggle). Note: we don't clear mirrorUrl when liveMirror goes
+  // false — the JSX condition `liveMirror && mirrorUrl` hides the input.
+  useEffect(() => {
+    if (!liveMirror) return
+    let cancelled = false
+    buildMirrorUrl().then((url) => {
+      if (!cancelled) setMirrorUrl(url)
+    })
+    return () => { cancelled = true }
+  }, [liveMirror, buildMirrorUrl])
+
+  // Copy the mirror URL to clipboard with toast + visual "Copied ✓" feedback.
+  const copyMirrorLink = useCallback(async () => {
+    if (!mirrorUrl) return
+    try {
+      if (navigator.clipboard) {
+        await navigator.clipboard.writeText(mirrorUrl)
+      } else {
+        const textarea = document.createElement('textarea')
+        textarea.value = mirrorUrl
+        document.body.appendChild(textarea)
+        textarea.select()
+        document.execCommand('copy')
+        document.body.removeChild(textarea)
+      }
+      setMirrorCopied(true)
+      setTimeout(() => setMirrorCopied(false), 2000)
+      toast({
+        title: 'Link Live Mirror disalin!',
+        description: `Salurkan ke perangkat peserta — ${mirrorUrl}`,
+      })
+    } catch {
+      toast({
+        title: 'Gagal menyalin',
+        description: 'Tidak dapat menyalin link. Salin manual dari kolom URL.',
+        variant: 'destructive',
+      })
+    }
+  }, [mirrorUrl, toast])
+
+  // ── Open Live Mirror on the external display (projector via HDMI) ──────
+  // Calls the Electron IPC handler that creates a separate BrowserWindow on
+  // the external display + loads the /mirror URL via localhost (no network
+  // latency → smooth, no WiFi streaming jank).
+  //
+  // User setup:
+  //   1. Connect projector via HDMI cable to the laptop.
+  //   2. Windows + P → "Extend" (NOT Duplicate — Duplicate shows the full
+  //      Operator panel on the projector).
+  //   3. Click this button → Electron opens the mirror window on the
+  //      projector, fullscreen, frameless.
+  //
+  // In browser mode (non-Electron), the button is hidden — there's no
+  // Electron IPC to open a BrowserWindow. The user would use the URL
+  // input + Copy button + manually open in a browser on the projector
+  // laptop.
+  const isElectronRuntime = typeof window !== 'undefined' && (window as any).saatirilAPI?.isElectron === true
+  // Tracks whether the mirror projector BrowserWindow is open → use the
+  // IPC fast path (Blob directly, no base64/socket.io) for smooth frames.
+  const [useIpcForMirror, setUseIpcForMirror] = useState(false)
+  const useIpcForMirrorRef = useRef(false)
+  useEffect(() => { useIpcForMirrorRef.current = useIpcForMirror }, [useIpcForMirror])
+
+  // Poll every 2s to check if the mirror window is open. If yes, use IPC.
+  // If no (window closed), fall back to socket.io. This auto-detects when
+  // the user clicks 'Buka di Projector' (window opens → IPC) or closes the
+  // window (window closes → socket.io).
+  useEffect(() => {
+    if (!isElectronRuntime) return
+    const api = (window as any).saatirilAPI
+    if (!api?.isMirrorWindowOpen) return
+    const check = async () => {
+      try {
+        const open = await api.isMirrorWindowOpen()
+        setUseIpcForMirror(!!open)
+      } catch {}
+    }
+    check() // immediate check on mount
+    const interval = setInterval(check, 2000)
+    return () => clearInterval(interval)
+  }, [isElectronRuntime])
+  const [projectorOpening, setProjectorOpening] = useState(false)
+  const handleOpenOnProjector = useCallback(async () => {
+    const api = (window as any).saatirilAPI
+    if (!api?.isElectron || !api.openMirrorOnProjector) {
+      toast({
+        title: 'Tidak tersedia',
+        description: 'Buka di Projector hanya tersedia di aplikasi Electron (portable.exe). Untuk browser, gunakan tombol Copy + buka URL di browser lain di laptop/projector.',
+        variant: 'destructive',
+      })
+      return
+    }
+    setProjectorOpening(true)
+    try {
+      const result = await api.openMirrorOnProjector(myChannel)
+      if (result.success) {
+        if (result.reason === 'ALREADY_OPEN') {
+          toast({
+            title: 'Mirror sudah terbuka di projector',
+            description: `Ch.${myChannel} — window sudah ada di external display. Difokuskan.`,
+          })
+        } else {
+          toast({
+            title: '✓ Live Mirror dibuka di projector',
+            description: `Ch.${myChannel} — tampilan kamera live + countdown sudah di external display (HDMI). Operator panel tetap di laptop ini.`,
+          })
+        }
+      } else if (result.reason === 'NO_EXTERNAL_DISPLAY') {
+        toast({
+          title: '⚠ Tidak ada layar eksternal',
+          description: 'Hubungkan projector via HDMI + set Windows ke mode Extend (Win+P → Extend), lalu klik tombol ini lagi.',
+          variant: 'destructive',
+        })
+      } else {
+        toast({
+          title: 'Gagal membuka di projector',
+          description: result.reason,
+          variant: 'destructive',
+        })
+      }
+    } catch (err: any) {
+      toast({
+        title: 'Error',
+        description: err?.message || 'unknown',
+        variant: 'destructive',
+      })
+    } finally {
+      setProjectorOpening(false)
+    }
+  }, [myChannel, toast])
+
+  // ── Close Projector handler ─────────────────────────────────────────────
+  // Closes the mirror projector BrowserWindow via Electron IPC. Also used
+  // by the auto-close useEffect (when project closes or component unmounts).
+  const [projectorClosing, setProjectorClosing] = useState(false)
+  const handleCloseProjector = useCallback(async () => {
+    const api = (window as any).saatirilAPI
+    if (!api?.isElectron || !api.closeMirrorProjector) return
+    setProjectorClosing(true)
+    try {
+      await api.closeMirrorProjector()
+      toast({
+        title: 'Projector ditutup',
+        description: `Window Live Mirror di external display sudah ditutup.`,
+      })
+    } catch (err: any) {
+      // Silent fail — the window might already be closed.
+    } finally {
+      setProjectorClosing(false)
+    }
+  }, [toast])
+
+  // ── Auto-close projector when project closes ────────────────────────────
+  // When the user goes back to the home/project-setup screen (currentProject
+  // becomes null), the operator panel keeps rendering (it shows "Memuat
+  // proyek..."). But the projector window should close — otherwise it stays
+  // open showing the last frame forever. This useEffect watches currentProject
+  // + closes the projector window when the project closes.
+  useEffect(() => {
+    if (!currentProject) {
+      const api = (window as any).saatirilAPI
+      if (api?.isElectron && api.closeMirrorProjector) {
+        api.closeMirrorProjector().catch(() => {})
+      }
+      // Also turn off Live Mirror — no point streaming frames when there's
+      // no project + no camera target.
+      if (liveMirrorRef.current) {
+        setLiveMirror(false)
+      }
+    }
+  }, [currentProject])
+
+  // ── Auto-close projector on component unmount ───────────────────────────
+  // Safety net: if the operator panel unmounts for any reason (e.g. user
+  // switches role, app closes), close the projector window too.
+  useEffect(() => {
+    return () => {
+      const api = (window as any).saatirilAPI
+      if (api?.isElectron && api.closeMirrorProjector) {
+        api.closeMirrorProjector().catch(() => {})
+      }
+    }
+  }, [])
+
   // Palm trigger: when ON, showing an open palm to the camera triggers the
   // selected shutter mode (manual → instant photo, timer → starts countdown).
   // This is a hands-free trigger, NOT a shutter mode itself.
@@ -368,6 +671,12 @@ export function OperatorPanel({ isAppFullscreen = false, onToggleAppFullscreen, 
   const nextRowRef = useRef<HTMLDivElement>(null)
   const streamRef = useRef<MediaStream | null>(null)
   const selectedDeviceRef = useRef<string>('')
+  // BUG #7 fix (audit Remote/Mirror batch 2): generation token so in-flight
+  // startCamera can detect that the camera was released during getUserMedia's
+  // await and bail out before assigning streamRef. Incremented each time the
+  // camera effect starts; cleanup sets it to -1 to invalidate any in-flight
+  // call.
+  const cameraGenRef = useRef<number>(0)
   const frameImgRef = useRef<HTMLImageElement | null>(null)
   const cameraZoneRef = useRef<HTMLDivElement>(null)
 
@@ -390,6 +699,78 @@ export function OperatorPanel({ isAppFullscreen = false, onToggleAppFullscreen, 
     } catch {}
     return null
   }, [config?.frame, currentProject?.id])
+
+  // ── Mirror config broadcast (filter + frame overlay) ────────────────────
+  // Sends the project's CSS filter (e.g. grayscale for B&W) + frame overlay
+  // data URL to the /mirror page so it can apply them via CSS (GPU-accelerated,
+  // no per-frame CPU cost). This is the KEY to applying effects WITHOUT
+  // lagging: the filter is applied once on the <img> element via
+  // img.style.filter, then the browser's GPU handles it for every rendered
+  // frame. The MIRROR_FRAME wire payload stays minimal (just the raw JPEG).
+  //
+  // IMPORTANT: This block MUST be after the `cssFilter` + `frameData`
+  // declarations above (lines 662-677). Otherwise the deps array
+  // `[cssFilter, frameData]` throws a TDZ error: "Cannot access 'e2' before
+  // initialization" (e2 = minified cssFilter/frameData variable name).
+  //
+  // Sent when:
+  // - liveMirror toggles ON (initial config send)
+  // - cssFilter changes (e.g. operator switches project preset)
+  // - frameData changes (e.g. operator loads a different frame)
+  // - myChannel changes (rare, but covers the case)
+  // - mirror client sends MIRROR_REQUEST (on its connect — gets the
+  //   current config immediately)
+  const sendMirrorConfig = useCallback(() => {
+    if (!liveMirrorRef.current) return
+    console.log('[SAATIRIL OP] sending MIRROR_CONFIG: cssFilter=', cssFilter, 'hasFrame=', !!frameData, 'deviceId=', selectedDeviceId, 'ch=', liveMirrorChannelRef.current)
+    emitLocal('MIRROR_CONFIG', {
+      cssFilter: cssFilter,
+      frameData: frameData || null,
+      // Native camera path: send the deviceId + aspectRatio + mirror so the
+      // mirror window can call getUserMedia itself → native 30 FPS video
+      // (no JPEG encoding/transfer). Chromium/Electron allows multiple
+      // renderer processes to share the same camera.
+      deviceId: selectedDeviceId || null,
+      aspectRatio: aspectRatio,
+      mirror: mirror,
+      channel: liveMirrorChannelRef.current,
+    })
+  }, [cssFilter, frameData, selectedDeviceId, aspectRatio, mirror])
+
+  // Watch config changes + emit MIRROR_CONFIG when they change (and
+  // liveMirror is ON).
+  useEffect(() => {
+    if (!liveMirror) return
+    sendMirrorConfig()
+  }, [liveMirror, sendMirrorConfig])
+
+  // Listen for MIRROR_REQUEST from mirror clients (sent on their connect)
+  // → respond with the current MIRROR_CONFIG so they get the filter + frame
+  // immediately, not just on the next config change.
+  useEffect(() => {
+    const handleMirrorRequest = (data: { channel?: number }) => {
+      console.log('[SAATIRIL OP] received MIRROR_REQUEST:', data, 'my channel=', liveMirrorChannelRef.current)
+      // Only respond to requests for OUR channel (the operator's channel).
+      if (data.channel && data.channel !== liveMirrorChannelRef.current) return
+      sendMirrorConfig()
+    }
+    onLocal('MIRROR_REQUEST', handleMirrorRequest)
+    return () => { offLocal('MIRROR_REQUEST', handleMirrorRequest) }
+  }, [sendMirrorConfig])
+
+  // Periodic re-emit MIRROR_CONFIG every 10 seconds as a fallback — ensures
+  // mirror clients always get the config within 10s of connecting, even if
+  // they missed the initial MIRROR_REQUEST → MIRROR_CONFIG handshake (e.g.
+  // socket reconnect, component mount timing). The cssFilter + frameData
+  // are small enough (frameData is a base64 string, ~50-200KB) that sending
+  // them every 10s is fine.
+  useEffect(() => {
+    if (!liveMirror) return
+    const interval = setInterval(() => {
+      sendMirrorConfig()
+    }, 10000)
+    return () => clearInterval(interval)
+  }, [liveMirror, sendMirrorConfig])
 
   // ── Resize Observer: calculate camera dimensions ─────────────────────────
   useEffect(() => {
@@ -464,11 +845,23 @@ export function OperatorPanel({ isAppFullscreen = false, onToggleAppFullscreen, 
     // (where students are 'active_N') the queue was ALWAYS empty after reopen,
     // even though the DB had the active students (PROSES count was correct).
     // 'sent'/'active_N' = NOT yet photographed (photographed = 'done' = excluded
-    // via doneIds). No alreadyPhotographed check (a 'sent'/'active_N' student
-    // is by definition not photographed; the check caused stale-photoHistory
-    // exclusion after reopen — see commit f96e64f).
+    // via doneIds).
+    //
+    // BUG #1 (audit-electron-side): we ALSO exclude students whose id already
+    // appears in the CURRENT-CHANNEL photoHistory (`alreadyPhotographed`). This
+    // prevents a fast-clicking operator from re-capturing a photoshoot student
+    // before the admin's SYNC_DB (which flips status to 'done') arrives, which
+    // previously created unintended v2 retake files on disk without the MC's
+    // explicit reset+resend flow. The historical stale-photoHistory exclusion
+    // bug (commit f96e64f) was a CROSS-CHANNEL problem; `alreadyPhotographed`
+    // here is built from CURRENT-channel entries only (line 828), so this is
+    // safe. In wisuda mode this is a no-op (those students are already 'done'
+    // and excluded via doneIds).
     const dbItems = currentProject.database.filter(
-      (s) => (s.status === 'sent' || isActiveStatus(s.status)) && !doneIds.has(s.id)
+      (s) =>
+        (s.status === 'sent' || isActiveStatus(s.status)) &&
+        !doneIds.has(s.id) &&
+        !alreadyPhotographed.has(s.id)
     )
     dbItems.forEach((s) => dbQueueIds.add(s.id))
     const bufferItems = mcCallBuffer.filter(
@@ -595,8 +988,15 @@ export function OperatorPanel({ isAppFullscreen = false, onToggleAppFullscreen, 
   }, [selectedDeviceId, myChannel])
 
   // ── Camera: start stream ─────────────────────────────────────────────────
+  // BUG #7 fix (audit Remote/Mirror batch 2): startCamera now accepts an
+  // optional generation token (gen). After the await getUserMedia, we check
+  // cameraGenRef.current — if it doesn't match gen, the camera was released
+  // during the await (cleanup ran, or a newer startCamera superseded us) so
+  // we stop the new stream immediately + bail out without touching streamRef.
+  // This prevents the in-flight getUserMedia from re-grabbing the camera
+  // after cleanup explicitly released it.
   const startCamera = useCallback(
-    async (deviceId?: string) => {
+    async (deviceId?: string, gen?: number) => {
       if (typeof navigator === 'undefined' || !navigator.mediaDevices) {
         setCameraAvailable(false)
         return
@@ -626,6 +1026,15 @@ export function OperatorPanel({ isAppFullscreen = false, onToggleAppFullscreen, 
 
       try {
         const stream = await navigator.mediaDevices.getUserMedia(constraints)
+        // BUG #7 fix: if the camera was released during the await (cleanup
+        // ran + cameraGenRef set to -1, or a newer startCamera superseded
+        // us with a different gen), stop the new stream immediately and bail
+        // out without touching streamRef — the cleanup already released the
+        // previous stream and we must NOT re-grab the camera.
+        if (gen !== undefined && cameraGenRef.current !== gen) {
+          stream.getTracks().forEach((t) => t.stop())
+          return
+        }
         streamRef.current = stream
         setCameraAvailable(true)
         if (videoRef.current) videoRef.current.srcObject = stream
@@ -653,6 +1062,11 @@ export function OperatorPanel({ isAppFullscreen = false, onToggleAppFullscreen, 
             fallbackConstraints = { video: true, audio: false }
           }
           const stream = await navigator.mediaDevices.getUserMedia(fallbackConstraints)
+          // BUG #7 fix: same generation check after the fallback await.
+          if (gen !== undefined && cameraGenRef.current !== gen) {
+            stream.getTracks().forEach((t) => t.stop())
+            return
+          }
           streamRef.current = stream
           setCameraAvailable(true)
           if (videoRef.current) videoRef.current.srcObject = stream
@@ -672,10 +1086,22 @@ export function OperatorPanel({ isAppFullscreen = false, onToggleAppFullscreen, 
     // (admin on Admin/MC tab), release the camera so the Operator Electron App
     // (if running on the same laptop) can use it. When cameraActive becomes
     // true (admin switches to Live/Operator view), re-start the camera.
-    if (cameraActive) {
-      queueMicrotask(() => void startCamera())
-    }
+    //
+    // BUG #7 fix (audit Remote/Mirror batch 2): previously used
+    //   queueMicrotask(() => void startCamera())
+    // but the microtask could fire AFTER cleanup ran (if cameraActive flipped
+    // back to false, or React StrictMode double-invoked the effect), causing
+    // startCamera() to re-acquire the camera we just released — visible as a
+    // brief camera grab on the operator Electron app or a "camera in use"
+    // error. Now we call startCamera directly + use a generation token
+    // (cameraGenRef) so any in-flight getUserMedia can detect that the camera
+    // was released during the await and bail out before touching streamRef.
+    if (!cameraActive) return
+    const gen = ++cameraGenRef.current
+    void startCamera(undefined, gen)
     return () => {
+      // Invalidate this generation so any in-flight startCamera aborts.
+      cameraGenRef.current = -1
       // Always release on cleanup (unmount OR cameraActive flip to false).
       if (streamRef.current) {
         streamRef.current.getTracks().forEach((t) => t.stop())
@@ -710,9 +1136,14 @@ export function OperatorPanel({ isAppFullscreen = false, onToggleAppFullscreen, 
     // This was the root cause of the dual-photoshoot camera conflict: device
     // selections triggered by the channel selector / device list bypassed the
     // cameraActive gate. Now the camera only starts when cameraActive is true.
+    //
+    // BUG #7 fix (audit Remote/Mirror batch 2): drop queueMicrotask + use the
+    // generation token so a stale device-change doesn't grab the camera after
+    // a newer selection (or a cameraActive=false cleanup) invalidated it.
     if (cameraActive && selectedDeviceId && selectedDeviceRef.current !== selectedDeviceId) {
       selectedDeviceRef.current = selectedDeviceId
-      queueMicrotask(() => void startCamera(selectedDeviceId))
+      const gen = ++cameraGenRef.current
+      void startCamera(selectedDeviceId, gen)
     }
   }, [selectedDeviceId, startCamera, cameraActive])
 
@@ -890,6 +1321,187 @@ export function OperatorPanel({ isAppFullscreen = false, onToggleAppFullscreen, 
     return () => { offLocal('SYNC_DB', handleSyncDb) }
   }, [setOpCurrentTarget, resetOpState, updateCurrentProject])
 
+  // ── Live Mirror: stream video frames at ~10 FPS to the /mirror page ────
+  // Captures a JPEG frame from the local <video> element via a small canvas
+  // (640px wide, aspect-correct height) and emits lan-message MIRROR_FRAME
+  // on this channel. The /mirror page (opened on a separate device or 2nd
+  // monitor) renders the frame fullscreen. Stops when the operator disables
+  // the toggle or the camera goes inactive — cleanup runs on unmount too.
+  // MIRROR_COUNTDOWN is emitted from a separate useEffect watching
+  // effectiveTimerCountdown; MIRROR_CAPTURE is emitted in finalizeCapture.
+  useEffect(() => {
+    if (!liveMirror || !cameraAvailable) {
+      if (mirrorIntervalRef.current) {
+        clearInterval(mirrorIntervalRef.current)
+        mirrorIntervalRef.current = null
+      }
+      return
+    }
+
+    // ── Performance tuning ────────────────────────────────────────────────
+    // 15 FPS target with IPC fast path (Electron + mirror window open) —
+    // the Blob goes directly via IPC (structured clone, ~1ms), no base64
+    // encoding, no socket.io, no JSON. The only per-frame cost is the
+    // toBlob JPEG encoding (async, off-thread ~5-15ms). At 15 FPS
+    // (67ms interval), the encoder has 50ms+ headroom → smooth.
+    // Falls back to 10 FPS socket.io path (FileReader → base64) when no
+    // mirror window is open (cross-device tablet/phone scenario).
+    // Width 480 + quality 0.4 → JPEG ~15-25KB. At 15 FPS = ~225-375 KB/s.
+    const MIRROR_FPS = 15
+    const MIRROR_WIDTH = 480
+    const MIRROR_QUALITY = 0.4
+
+    // Reusable canvas (off-screen) — avoids GC churn at 10 FPS.
+    const mirrorCanvas = document.createElement('canvas')
+    const mirrorCtx = mirrorCanvas.getContext('2d')
+    if (!mirrorCtx) return
+
+    let emittedCount = 0
+    let skippedCount = 0
+    let processing = false  // true while a toBlob() is encoding — drop new ticks
+    let lastCanvasKey = ''
+    mirrorIntervalRef.current = setInterval(() => {
+      // If the previous toBlob() is still in flight, skip this tick — we'd
+      // just queue up another encode + pile memory pressure. The next tick
+      // will pick up a fresh frame.
+      if (processing) return
+
+      const video = videoRef.current
+      if (!video || video.readyState < 2 || video.videoWidth <= 0) {
+        skippedCount++
+        if (skippedCount === 30) {
+          console.warn('[SAATIRIL OP] mirror: 30 frames skipped (video null/ not ready).', {
+            videoExists: !!video,
+            readyState: video?.readyState,
+            videoWidth: video?.videoWidth,
+          })
+          skippedCount = 0
+        }
+        return
+      }
+      // Use the configured aspectRatio so the mirror view matches the
+      // operator's capture aspect (no distortion). The canvas dimensions
+      // only update when the aspect changes (avoids clearing every tick).
+      const newW = MIRROR_WIDTH
+      const newH = Math.max(1, Math.round(MIRROR_WIDTH / aspectRatio))
+      const newKey = newW + 'x' + newH
+      if (newKey !== lastCanvasKey) {
+        mirrorCanvas.width = newW
+        mirrorCanvas.height = newH
+        lastCanvasKey = newKey
+      }
+      // Compute crop region from the video to match the configured aspect
+      // ratio (center crop, same logic as handleCapture). This is just a
+      // drawImage with computed sx/sy/sw/sh — NO extra CPU cost vs a
+      // non-cropped drawImage. Necessary to avoid stretching/distortion.
+      const videoWidth = video.videoWidth
+      const videoHeight = video.videoHeight
+      const videoRatio = videoWidth / videoHeight
+      let sx = 0, sy = 0, sw = videoWidth, sh = videoHeight
+      if (videoRatio > aspectRatio) {
+        sw = videoHeight * aspectRatio
+        sx = (videoWidth - sw) / 2
+      } else {
+        sh = videoWidth / aspectRatio
+        sy = (videoHeight - sh) / 2
+      }
+      try {
+        // RAW camera only — no ctx.filter, no frame overlay. This is the
+        // "apa adanya" path: just drawImage the video frame to the canvas.
+        // Filter + frame were removed because they added per-frame CPU
+        // overhead that caused lagging on the projector.
+        mirrorCtx.drawImage(video, sx, sy, sw, sh, 0, 0, mirrorCanvas.width, mirrorCanvas.height)
+      } catch (err) {
+        // Cross-origin tainted canvas (shouldn't happen with local getUserMedia
+        // stream, but guard anyway so the interval doesn't crash silently).
+        console.warn('[SAATIRIL OP] mirror frame draw failed:', err)
+        return
+      }
+      // toBlob is ASYNC + non-blocking (unlike toDataURL which is sync).
+      // The JPEG encoder runs off the main thread → no UI jank. Then we use
+      // FileReader.readAsDataURL to convert the Blob to a base64 string
+      // (also async + off-thread) before sending. The string path is the
+      // SAME wire format that worked at commit 1df4732 — socket.io v4
+      // binary Blob transfer had issues on the mirror side (black screen
+      // regression), so we stick with the proven base64 string approach
+      // but keep the perf wins from async encoding + lower res/quality.
+      processing = true
+      mirrorCanvas.toBlob((blob) => {
+        if (!blob) {
+          processing = false
+          return
+        }
+        // If toggle went OFF mid-encode, skip emitting.
+        if (!liveMirrorRef.current) {
+          processing = false
+          return
+        }
+
+        // ── IPC FAST PATH (Electron + mirror window open) ──────────────
+        // Send the Blob directly to the mirror projector BrowserWindow
+        // via IPC (structured clone). No base64 encoding, no JSON
+        // serialization, no socket.io wire transfer. Much faster →
+        // smooth on the projector.
+        //
+        // IMPORTANT: This is a BONUS fast path, NOT a replacement for
+        // socket.io. We ALWAYS also send via socket.io (below) as a
+        // backup. If IPC fails for any reason (Blob not structured-cloned
+        // correctly, mirror window preload issue, etc.), the socket.io
+        // path ensures the mirror still gets frames. Without the socket.io
+        // backup, an IPC failure → permanent black screen (which is what
+        // the user experienced at commit 07a1ce5).
+        let ipcSent = false
+        if (useIpcForMirrorRef.current) {
+          const api = (window as any).saatirilAPI
+          if (api?.sendMirrorFrame) {
+            try {
+              api.sendMirrorFrame(blob)
+              ipcSent = true
+            } catch (err) {
+              console.warn('[SAATIRIL OP] IPC sendMirrorFrame failed, falling back to socket.io only:', err)
+            }
+          }
+        }
+
+        // ── SOCKET.IO PATH (always — backup + cross-device) ─────────────
+        // Convert blob → data URL string off-thread via FileReader. This
+        // is the base64 encoding step — by doing it via FileReader we
+        // keep the main thread responsive. ALWAYS run this path (even
+        // when IPC was sent) so the mirror has a backup if IPC fails.
+        const reader = new FileReader()
+        reader.onload = () => {
+          processing = false
+          const dataUrl = reader.result
+          if (typeof dataUrl !== 'string') return
+          if (!liveMirrorRef.current) return
+          emitLocal('MIRROR_FRAME', { frame: dataUrl, channel: liveMirrorChannelRef.current })
+          emittedCount++
+          if (emittedCount === 30) {
+            const sk = getSocket()
+            console.log('[SAATIRIL OP] mirror: 30 frames emitted (ch' + liveMirrorChannelRef.current + ').',
+              'ipc=' + (ipcSent ? 'yes' : 'no'),
+              'frame size=', Math.round(dataUrl.length / 1024) + 'KB',
+              'socket.connected=', sk?.connected ?? false,
+              'socket.id=', sk?.id ?? 'null')
+            emittedCount = 0
+          }
+        }
+        reader.onerror = () => {
+          processing = false
+          console.warn('[SAATIRIL OP] mirror FileReader failed')
+        }
+        reader.readAsDataURL(blob)
+      }, 'image/jpeg', MIRROR_QUALITY)
+    }, 1000 / MIRROR_FPS)
+
+    return () => {
+      if (mirrorIntervalRef.current) {
+        clearInterval(mirrorIntervalRef.current)
+        mirrorIntervalRef.current = null
+      }
+    }
+  }, [liveMirror, cameraAvailable, aspectRatio])
+
   // ── Finalize capture ────────────────────────────────────────────────────
   // OPTIMIZED: Removed 400ms of unnecessary delays, added STUDENT_DONE lightweight
   // event for immediate MC unblocking, and SYNC_DB now strips photos (tiny payload).
@@ -900,6 +1512,12 @@ export function OperatorPanel({ isAppFullscreen = false, onToggleAppFullscreen, 
 
       const dataUrl = canvas.toDataURL('image/jpeg', 0.95)
       addOpCapturedPhoto(dataUrl)
+
+      // Live Mirror: emit MIRROR_CAPTURE so the /mirror page does a white
+      // flash overlay (matches the operator's local flash timing).
+      if (liveMirrorRef.current) {
+        emitLocal('MIRROR_CAPTURE', { channel: liveMirrorChannelRef.current })
+      }
 
       const currentPhotos = useSaatirilStore.getState().opCapturedPhotosByChannel[myChannel] ?? []
       const currentTarget = useSaatirilStore.getState().opCurrentTargets[myChannel] ?? null
@@ -960,8 +1578,8 @@ export function OperatorPanel({ isAppFullscreen = false, onToggleAppFullscreen, 
         const version = prevVersion + 1
         const newVersions = { ...currentVersions, [versionKey]: version }
         const filename = isPhotoshootModeFlag
-          ? buildPhotoshootFilename(student.nim, student.nama, myChannel, version)
-          : buildFilename(student.nim, student.nama, 1, 'Toga', version) // placeholder; standard mode overrides below
+          ? buildPhotoshootFilename(student.nim, student.nama, myChannel, version, student.id)
+          : buildFilename(student.nim, student.nama, 1, 'Toga', version, student.id) // placeholder; standard mode overrides below
         return { version, newVersions, filename }
       }
 
@@ -1024,7 +1642,16 @@ export function OperatorPanel({ isAppFullscreen = false, onToggleAppFullscreen, 
           if (api?.savePhoto) {
             const targetFolder = projConfig.targetFolder
             console.log(`[SAATIRIL OP] Saving photo to disk: ${targetFolder}/${vFilename}`)
-            api.savePhoto({ base64Data: allPhotos[0], filename: vFilename, targetFolder }).then((path: string | null) => {
+            api.savePhoto({
+              base64Data: allPhotos[0],
+              filename: vFilename,
+              targetFolder,
+              // Pass backupFolder + projectName so the Electron savePhoto IPC
+              // creates a project subfolder in the backup folder (mirrors
+              // local structure: backupFolder/projectName/filename).
+              backupFolder: projConfig.driveFolder ?? null,
+              projectName: useSaatirilStore.getState().currentProject?.name ?? null,
+            }).then((path: string | null) => {
               // Detect the legacy fake-delegation sentinel returned by an OLD
               // operator-exe preload (pre-fix). The new preload (after CHANGE 3)
               // returns a real filesystem path or null — never this sentinel.
@@ -1098,8 +1725,8 @@ export function OperatorPanel({ isAppFullscreen = false, onToggleAppFullscreen, 
         // v1 → `NIM_Nama_1_Toga.jpg` + `NIM_Nama_2_Ijazah.jpg`
         // v2 → `NIM_Nama_1_Toga_v2.jpg` + `NIM_Nama_2_Ijazah_v2.jpg`
         const { version, newVersions } = computeVersionedFilename(student, false)
-        const togaFilename = buildFilename(student.nim, student.nama, 1, 'Toga', version)
-        const ijazahFilename = buildFilename(student.nim, student.nama, 2, 'Ijazah', version)
+        const togaFilename = buildFilename(student.nim, student.nama, 1, 'Toga', version, student.id)
+        const ijazahFilename = buildFilename(student.nim, student.nama, 2, 'Ijazah', version, student.id)
         console.log(`[SAATIRIL OP] Standard capture v${version} for ${student.nama}: ${togaFilename}, ${ijazahFilename}`)
 
         console.log('[SAATIRIL OP] Emitting STUDENT_DONE + PHOTOS_SAVED for student:', student.nama, 'channel:', myChannel, 'version:', version)
@@ -1132,8 +1759,20 @@ export function OperatorPanel({ isAppFullscreen = false, onToggleAppFullscreen, 
             const targetFolder = projConfig.targetFolder
             console.log(`[SAATIRIL OP] Saving 2 photos to disk: ${targetFolder}/`)
             Promise.all([
-              api.savePhoto({ base64Data: allPhotos[0], filename: togaFilename, targetFolder }),
-              api.savePhoto({ base64Data: allPhotos[1], filename: ijazahFilename, targetFolder }),
+              api.savePhoto({
+                base64Data: allPhotos[0],
+                filename: togaFilename,
+                targetFolder,
+                backupFolder: projConfig.driveFolder ?? null,
+                projectName: useSaatirilStore.getState().currentProject?.name ?? null,
+              }),
+              api.savePhoto({
+                base64Data: allPhotos[1],
+                filename: ijazahFilename,
+                targetFolder,
+                backupFolder: projConfig.driveFolder ?? null,
+                projectName: useSaatirilStore.getState().currentProject?.name ?? null,
+              }),
             ]).then(([path1, path2]) => {
               // Detect the legacy fake-delegation sentinel returned by an OLD
               // operator-exe preload (pre-fix). The new preload (after CHANGE 3)
@@ -1281,6 +1920,19 @@ export function OperatorPanel({ isAppFullscreen = false, onToggleAppFullscreen, 
 
   // Derived: only show countdown when in ready phase
   const effectiveTimerCountdown = (capturePhase === 'ready-1' || capturePhase === 'ready-2') ? timerCountdown : 0
+
+  // ── Live Mirror: emit MIRROR_COUNTDOWN when the timer ticks ────────────
+  // Watches effectiveTimerCountdown (the displayed countdown — only updates
+  // during the 'ready-1' / 'ready-2' phases). Each tick → mirror shows the
+  // number with a pulse animation. When it hits 0, finalizeCapture emits
+  // MIRROR_CAPTURE for the flash.
+  const prevMirrorCountdownRef = useRef(0)
+  useEffect(() => {
+    if (!liveMirror) return
+    if (effectiveTimerCountdown === prevMirrorCountdownRef.current) return
+    prevMirrorCountdownRef.current = effectiveTimerCountdown
+    emitLocal('MIRROR_COUNTDOWN', { seconds: effectiveTimerCountdown, channel: liveMirrorChannelRef.current })
+  }, [liveMirror, effectiveTimerCountdown])
 
   const startTimer = useCallback(() => {
     if (!isTimerMode(effectiveShutterMode)) return
@@ -1637,6 +2289,154 @@ export function OperatorPanel({ isAppFullscreen = false, onToggleAppFullscreen, 
             </>
           )}
         </button>
+
+        {/* Row 4: Live Mirror broadcast — streams the camera frames at ~10 FPS
+            to the /mirror page (opened on a separate device or 2nd monitor) so
+            participants can see themselves + the countdown + the photo flash
+            without disturbing the operator's panel. Independent of the local
+            Mirror toggle (Row 3) which only flips the operator's preview. */}
+        <button
+          onClick={() => setLiveMirror((v) => !v)}
+          className={`flex items-center gap-1 rounded-md font-semibold transition-all duration-200 cursor-pointer w-full min-w-0 ${
+            compact ? 'px-1 py-0.5 text-[8px]' : 'px-2 py-1.5 text-[10px]'
+          } ${liveMirror ? 'scale-[1.02]' : 'hover:bg-white/5'}`}
+          style={{
+            backgroundColor: liveMirror ? `${THEME.cyan}22` : THEME.panel,
+            color: liveMirror ? THEME.cyan : THEME.muted,
+            border: `1px solid ${liveMirror ? THEME.cyan : THEME.border}`,
+            boxShadow: liveMirror ? `0 0 8px ${THEME.cyan}22` : 'none',
+          }}
+          title={`Live Mirror — stream kamera ke layar peserta.
+
+Buka di perangkat lain (tablet / HP / laptop 2 / projector):
+  http://<IP-LAPTOP-INI>:81/mirror?channel=${myChannel}
+Atau via Caddy gateway:
+  http://<IP-LAPTOP-INI>/mirror?channel=${myChannel}&XTransformPort=81
+
+  ?channel=${myChannel}  — saluran kamera ini
+  ?flip=0         — nonaktifkan mirror (default: flipped = bercmin)
+  ?ip=...         — override IP socket.io
+
+Klik layar untuk fullscreen. Tombol: F = fullscreen, M = flip mirror.`}
+        >
+          <Cast className="size-3" />
+          <span className="font-bold">Live Mirror</span>
+          {liveMirror && (
+            <>
+              <span style={{ color: THEME.muted }}>•</span>
+              <span className={`text-[8px] ${compact ? '' : 'text-[9px]'}`} style={{ color: THEME.cyan }}>
+                ch{myChannel} ✓
+              </span>
+            </>
+          )}
+        </button>
+
+        {/* Live Mirror URL — copy-paste-ready link with the laptop's LAN IP,
+            shown ONLY when Live Mirror is ON. Click 'Copy' to copy to
+            clipboard; the field is read-only so the operator can also
+            manually select + Ctrl+C if needed. */}
+        {liveMirror && (
+          <>
+          <div
+            className={`flex items-stretch gap-1 min-w-0 ${compact ? 'mt-1' : 'mt-1.5'}`}
+          >
+            <input
+              type="text"
+              readOnly
+              value={mirrorUrl}
+              placeholder="Memuat URL…"
+              onClick={(e) => (e.target as HTMLInputElement).select()}
+              className={`flex-1 min-w-0 px-2 rounded-md font-mono bg-[#1a0b2e] text-white border outline-none cursor-text
+                ${compact ? 'text-[8px] py-0.5' : 'text-[9px] py-1'}
+                ${mirrorCopied ? 'border-[#4ade80]/70' : 'border-[#533485]'}`}
+              style={{
+                boxShadow: mirrorCopied ? '0 0 6px rgba(74, 222, 128, 0.35)' : 'none',
+              }}
+              title="URL Live Mirror — klik untuk select all, lalu Ctrl+C"
+            />
+            <button
+              type="button"
+              onClick={copyMirrorLink}
+              disabled={!mirrorUrl}
+              className={`flex items-center justify-center gap-1 rounded-md font-semibold transition-all duration-200 shrink-0 cursor-pointer
+                ${compact ? 'px-1.5 py-0.5 text-[8px]' : 'px-2 py-1 text-[9px]'}
+                ${mirrorCopied ? 'hover:scale-[1.02]' : 'hover:bg-white/5'}`}
+              style={{
+                backgroundColor: mirrorCopied ? `${THEME.emerald}22` : THEME.panel,
+                color: mirrorCopied ? THEME.emerald : THEME.cyan,
+                border: `1px solid ${mirrorCopied ? THEME.emerald : THEME.cyan + '55'}`,
+              }}
+              title="Salin URL ke clipboard"
+            >
+              {mirrorCopied ? (
+                <>
+                  <Check className={compact ? 'size-2.5' : 'size-3'} />
+                  <span>Disalin</span>
+                </>
+              ) : (
+                <>
+                  <Copy className={compact ? 'size-2.5' : 'size-3'} />
+                  <span>Copy</span>
+                </>
+              )}
+            </button>
+          </div>
+
+          {/* Buka/Tutup Projector buttons — only in Electron runtime. Opens
+              or closes a separate BrowserWindow on the external display
+              (HDMI) via Electron IPC. Two buttons side-by-side so the
+              user can manually open/close the projector window without
+              having to toggle Live Mirror off + on. */}
+          {isElectronRuntime && (
+            <div className={`flex gap-1 w-full ${compact ? 'mt-1' : 'mt-1.5'}`}>
+              <button
+                type="button"
+                onClick={handleOpenOnProjector}
+                disabled={projectorOpening}
+                className={`flex items-center justify-center gap-1 rounded-md font-bold transition-all duration-200 flex-1 cursor-pointer
+                  ${compact ? 'px-1.5 py-1 text-[9px]' : 'px-2 py-1.5 text-[10px]'}
+                  ${projectorOpening ? 'opacity-60 cursor-wait' : 'hover:scale-[1.01]'}`}
+                style={{
+                  backgroundColor: `${THEME.cyan}22`,
+                  color: THEME.cyan,
+                  border: `1px solid ${THEME.cyan}55`,
+                }}
+                title={`Buka window Live Mirror di external display (projector via HDMI).
+
+PRASYARAT:
+1. Hubungkan projector via HDMI ke laptop ini.
+2. Windows + P → pilih "Extend" (BUKAN Duplicate).
+3. Klik tombol ini → Electron otomatis buka window di projector,
+   fullscreen + frameless. Window menampilkan live camera +
+   countdown saja (tidak ada UI Operator).
+
+Kalau tombol tidak aktif atau muncul error "Tidak ada layar
+eksternal" → cek koneksi HDMI + pastikan Windows di mode Extend.`}
+              >
+                <Monitor className={compact ? 'size-3' : 'size-3.5'} />
+                <span>Buka</span>
+              </button>
+              <button
+                type="button"
+                onClick={handleCloseProjector}
+                disabled={projectorClosing}
+                className={`flex items-center justify-center gap-1 rounded-md font-bold transition-all duration-200 flex-1 cursor-pointer
+                  ${compact ? 'px-1.5 py-1 text-[9px]' : 'px-2 py-1.5 text-[10px]'}
+                  ${projectorClosing ? 'opacity-60 cursor-wait' : 'hover:scale-[1.01]'}`}
+                style={{
+                  backgroundColor: `${THEME.red}22`,
+                  color: THEME.red,
+                  border: `1px solid ${THEME.red}55`,
+                }}
+                title="Tutup window Live Mirror di external display. Window juga otomatis tertutup saat kembali ke halaman depan / membuat project baru."
+              >
+                <PowerOff className={compact ? 'size-3' : 'size-3.5'} />
+                <span>Tutup</span>
+              </button>
+            </div>
+          )}
+          </>
+        )}
       </div>
     )
   }

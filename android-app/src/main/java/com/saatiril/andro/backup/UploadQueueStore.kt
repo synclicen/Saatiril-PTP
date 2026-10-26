@@ -29,7 +29,10 @@ class UploadQueueStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, nu
     companion object {
         private const val TAG = "UploadQueueStore"
         private const val DB_NAME = "saatiril_upload_queue.db"
-        private const val DB_VERSION = 1
+        // BUG #6: bumped 1 → 2 to add the tree_uri column (per-project Drive
+        // backup target). The onUpgrade path ALTERs the existing table so
+        // existing installations keep their queue.
+        private const val DB_VERSION = 2
 
         private const val TABLE = "upload_queue"
         private const val COL_ID = "id"
@@ -41,6 +44,10 @@ class UploadQueueStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, nu
         private const val COL_CREATED_AT = "created_at"
         private const val COL_UPLOADED_AT = "uploaded_at"
         private const val COL_ERROR = "error"
+        // BUG #6: per-project Drive tree URI. Null/empty → use the global
+        // backup folder (legacy behavior). Non-null → upload to this
+        // project's specific Drive subfolder.
+        private const val COL_TREE_URI = "tree_uri"
 
         const val STATUS_PENDING = "pending"
         const val STATUS_UPLOADING = "uploading"
@@ -66,7 +73,8 @@ class UploadQueueStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, nu
                 $COL_RETRY_COUNT INTEGER NOT NULL DEFAULT 0,
                 $COL_CREATED_AT INTEGER NOT NULL,
                 $COL_UPLOADED_AT INTEGER,
-                $COL_ERROR TEXT
+                $COL_ERROR TEXT,
+                $COL_TREE_URI TEXT
             )
         """.trimIndent())
         db.execSQL("CREATE INDEX idx_status ON $TABLE ($COL_STATUS)")
@@ -74,15 +82,35 @@ class UploadQueueStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, nu
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
-        db.execSQL("DROP TABLE IF EXISTS $TABLE")
-        onCreate(db)
+        // BUG #6: migrate v1 → v2 by adding the tree_uri column. ALTER TABLE
+        // ADD COLUMN preserves existing rows (their tree_uri defaults to NULL
+        // → upload via the global backup folder, same as before).
+        if (oldVersion < 2) {
+            try {
+                db.execSQL("ALTER TABLE $TABLE ADD COLUMN $COL_TREE_URI TEXT")
+                Log.i(TAG, "BUG#6: added $COL_TREE_URI column (v1 → v2)")
+            } catch (e: Exception) {
+                Log.w(TAG, "BUG#6: ALTER TABLE failed (column may already exist): ${e.message}")
+            }
+        }
+    }
+
+    override fun onDowngrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
+        // BUG #6: no-op — keep the existing table. New columns added by a
+        // newer app version are harmless for an older app version (ignored).
+        Log.i(TAG, "onDowngrade: $oldVersion → $newVersion (keeping existing table)")
     }
 
     /**
      * Add a photo to the upload queue.
      * Called immediately after [com.saatiril.andro.util.PhotoSaver.savePhoto] succeeds.
+     *
+     * BUG #6: [treeUri] is the per-project Drive folder (SAF tree URI string).
+     * Null/empty → upload via the global backup folder (legacy behavior).
+     * Non-null → upload to this project's specific Drive subfolder. The
+     * DriveUploadWorker reads this column and routes the upload accordingly.
      */
-    fun enqueue(filename: String, localUri: String, projectName: String): Long {
+    fun enqueue(filename: String, localUri: String, projectName: String, treeUri: String? = null): Long {
         val values = ContentValues().apply {
             put(COL_FILENAME, filename)
             put(COL_LOCAL_URI, localUri)
@@ -90,9 +118,11 @@ class UploadQueueStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, nu
             put(COL_STATUS, STATUS_PENDING)
             put(COL_RETRY_COUNT, 0)
             put(COL_CREATED_AT, System.currentTimeMillis())
+            // BUG #6: store the per-project tree URI (may be null → global folder).
+            put(COL_TREE_URI, treeUri)
         }
         val id = writableDatabase.insertWithOnConflict(TABLE, null, values, SQLiteDatabase.CONFLICT_REPLACE)
-        Log.i(TAG, "Enqueued upload: $filename (id=$id)")
+        Log.i(TAG, "Enqueued upload: $filename (id=$id, treeUri=${if (treeUri.isNullOrEmpty()) "global" else "per-project"})")
         return id
     }
 
@@ -111,6 +141,26 @@ class UploadQueueStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, nu
         )
         return cursor.use { c ->
             if (c.moveToFirst()) cursorToItem(c) else null
+        }
+    }
+
+    /**
+     * ISSUE 1 fix: reset all UPLOADING items back to PENDING.
+     * Called on worker start to recover from stuck items — if the app was
+     * killed (Android power management, crash) while an item was UPLOADING,
+     * that item would stay in UPLOADING status forever (dequeue only returns
+     * PENDING items) → remaining items never processed → "only 1 photo
+     * uploaded" bug.
+     */
+    fun resetStuckItems() {
+        val count = writableDatabase.update(
+            TABLE,
+            ContentValues().apply { put(COL_STATUS, STATUS_PENDING) },
+            "$COL_STATUS = ?",
+            arrayOf(STATUS_UPLOADING)
+        )
+        if (count > 0) {
+            Log.i(TAG, "resetStuckItems: reset $count stuck UPLOADING items → PENDING")
         }
     }
 
@@ -264,7 +314,13 @@ class UploadQueueStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, nu
             projectName = c.getString(c.getColumnIndexOrThrow(COL_PROJECT_NAME)),
             status = c.getString(c.getColumnIndexOrThrow(COL_STATUS)),
             retryCount = c.getInt(c.getColumnIndexOrThrow(COL_RETRY_COUNT)),
-            createdAt = c.getLong(c.getColumnIndexOrThrow(COL_CREATED_AT))
+            createdAt = c.getLong(c.getColumnIndexOrThrow(COL_CREATED_AT)),
+            // BUG #6: read tree_uri. Use getColumnIndex (returns -1 if column
+            // is missing — possible on a v1 DB that wasn't yet upgraded) and
+            // fall back to null.
+            treeUri = c.getColumnIndex(COL_TREE_URI).let { idx ->
+                if (idx < 0 || c.isNull(idx)) null else c.getString(idx)
+            }
         )
     }
 }
@@ -276,7 +332,9 @@ data class UploadItem(
     val projectName: String,
     val status: String,
     val retryCount: Int,
-    val createdAt: Long
+    val createdAt: Long,
+    /** BUG #6: per-project Drive folder (SAF tree URI). Null → use global backup folder. */
+    val treeUri: String? = null
 )
 
 data class UploadStats(

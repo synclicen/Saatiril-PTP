@@ -22,7 +22,13 @@ const MAX_HTTP_BUFFER = 20e6 // 20MB — supports dual-channel photo bursts (4 �
 const PING_INTERVAL = 5000   // 5s — aggressive ping for crowded WiFi (was 10s)
 const PING_TIMEOUT = 15000   // 15s — fail faster when device unreachable (was 20s)
 const MAX_CONNECTIONS = 10   // Max concurrent clients (admin + 2×MC + 2×OP + buffer)
-const IDENTIFICATION_TIMEOUT_MS = 10000 // 10s — clients must identify within this time
+// BUG #1 cross-cutting fix (audit Remote/Mirror batch 2): the value is now
+// 30000ms (extended from 10s to give non-admin clients time to enter the
+// session password before being disconnected). Previously the constant was
+// declared as 10000 but never used — the actual setTimeout used a hardcoded
+// 30000 literal. Now the constant drives the setTimeout so there's a single
+// source of truth (and the startup log line below is accurate).
+const IDENTIFICATION_TIMEOUT_MS = 30000 // 30s — clients must identify within this time
 
 // ─── Health tracking ───────────────────────────────────────────────────────
 let totalMessagesRelayed = 0
@@ -130,16 +136,19 @@ io.on('connection', (socket: Socket) => {
     passwordRequired: sessionPasswordHash !== null,
   })
 
-  // ── Identification timeout — disconnect if not identified within 30s ───
-  // Extended from 10s to 30s to give non-admin clients time to enter
-  // the session password before being disconnected.
+  // ── Identification timeout — disconnect if not identified within IDENTIFICATION_TIMEOUT_MS ───
+  // BUG #1 cross-cutting fix: previously used a hardcoded 30000 literal that
+  // drifted from the IDENTIFICATION_TIMEOUT_MS constant (which was 10000).
+  // Now both use the same 30000ms value — single source of truth. The 30s
+  // window gives non-admin clients time to enter the session password before
+  // being disconnected.
   const identificationTimeout = setTimeout(() => {
     const info = clientRegistry.get(socket.id)
     if (info && info.role === 'unknown') {
-      console.warn(`[SAATIRIL] Client ${socket.id} disconnected: failed to identify within 30s`)
+      console.warn(`[SAATIRIL] Client ${socket.id} disconnected: failed to identify within ${IDENTIFICATION_TIMEOUT_MS}ms`)
       socket.disconnect(true)
     }
-  }, 30000)
+  }, IDENTIFICATION_TIMEOUT_MS)
 
   // ── SET_SESSION_PASSWORD — admin sets the session password ─────────────
   socket.on('SET_SESSION_PASSWORD', (data: { passwordHash: string }) => {
@@ -171,18 +180,31 @@ io.on('connection', (socket: Socket) => {
     const info = clientRegistry.get(socket.id)
     if (!info) return
 
-    // Validate session password for non-admin when password is set
-    if (data.role !== 'admin' && sessionPasswordHash) {
-      if (!data.sessionPasswordHash || data.sessionPasswordHash !== sessionPasswordHash) {
-        console.warn(`[SAATIRIL] Client ${socket.id} rejected: invalid session password (role: ${data.role})`)
-        // Mark as 'auth-pending' so the identification timeout doesn't disconnect them
-        // while they're entering the password in the prompt
+    // BUG FIX (audit Remote BUG #1): admin role requires loopback origin.
+    if (data.role === 'admin') {
+      const addr = socket.handshake.address || ''
+      const isLoopback = addr === '127.0.0.1' || addr === '::1' || addr === '::ffff:127.0.0.1'
+      if (!isLoopback) {
+        console.warn(`[SAATIRIL] Client ${socket.id} rejected: admin role from non-loopback address ${addr}`)
         info.role = 'auth-pending'
         info.channel = data.channel
-        // Send BOTH auth-failed AND auth-requirement to ensure the client
-        // shows the password prompt. The auth-requirement event is critical
-        // because the client may have missed the initial one sent on connection
-        // (e.g., if the React component mounted after the event was dispatched).
+        socket.emit('auth-failed', { reason: 'admin_role_requires_loopback' })
+        return
+      }
+    }
+
+    // Validate session password for non-admin when password is set
+    if (data.role !== 'admin' && sessionPasswordHash) {
+      // BUG FIX (audit Remote BUG #6): timing-safe comparison.
+      const clientHash = data.sessionPasswordHash || ''
+      const expected = sessionPasswordHash
+      const a = Buffer.from(clientHash.padEnd(expected.length, '0'))
+      const b = Buffer.from(expected)
+      const matches = Buffer.compare(a, b) === 0 && clientHash.length === expected.length
+      if (!matches) {
+        console.warn(`[SAATIRIL] Client ${socket.id} rejected: invalid session password (role: ${data.role})`)
+        info.role = 'auth-pending'
+        info.channel = data.channel
         socket.emit('auth-failed', { reason: 'session_password_required' })
         socket.emit('auth-requirement', { passwordRequired: true })
         return  // Don't fully register the client
