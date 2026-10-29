@@ -147,6 +147,12 @@ class AdminViewModel(application: Application) : AndroidViewModel(application) {
 
     fun setUsbSafeMode(enabled: Boolean) = ptpCameraManager.setUsbSafeMode(enabled)
 
+    /** Live USB pipeline step, user-facing Indonesian (diagnostics) — see PTPCameraManager.usbDiag. */
+    val usbDiag: StateFlow<String?> get() = ptpCameraManager.usbDiag
+
+    /** Step the previous run died on, when the phone rebooted mid-USB-op — see PTPCameraManager.lastCrashStep. */
+    val lastUsbCrashStep: StateFlow<String?> get() = ptpCameraManager.lastCrashStep
+
 
     // Physical shutter sync — watch while PTP is connected AND enabled.
     // NOTE: this is a SECOND init block placed AFTER the camera properties

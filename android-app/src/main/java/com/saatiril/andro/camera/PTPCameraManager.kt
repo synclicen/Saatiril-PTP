@@ -103,18 +103,39 @@ class PTPCameraManager(private val context: Context) {
         private const val USB_POLL_INTERVAL_MS = 2000L // attach/detach polling fallback
 
         // ── External shutter watch (physical camera button sync) ──
-        private const val EXTERNAL_WATCH_POLL_MS = 800L    // watch pass interval
+        private const val EXTERNAL_WATCH_POLL_MS = 800L    // watch pass interval (fast mode)
         private const val EXTERNAL_SHOT_COOLDOWN_MS = 2500L // burst/bracket protection
         private const val EXTERNAL_RECENT_MS = 15_000L      // handle-dedupe window
 
-        // ── USB safe mode (kernel-panic workaround) ──
+        // ── USB safe mode (kernel-panic workaround, v2 "ultra safe") ──
         // Some phone USB host stacks (notably Unisoc / MediaTek chipsets) panic
-        // and reboot the phone when an app reads the PTP INTERRUPT endpoint or
-        // transacts immediately after claiming the interface. Safe mode avoids
-        // both: no interrupt reads (diff-only) + a settle delay after claim.
-        private const val SAFE_MODE_SETTLE_MS = 600L
+        // and reboot the phone during PTP/MTP over USB. Safe mode now removes
+        // EVERY known trigger pattern:
+        //   1. no interrupt-endpoint reads (events via GetObjectHandles diff)
+        //   2. claimInterface WITHOUT force first — force-unbinding an interface
+        //      is the classic usbfs panic trigger; force only as a settle-delayed
+        //      fallback when the polite claim is refused
+        //   3. settle delays: after grant before openDevice, after claim, between
+        //      handshake transactions
+        //   4. 16KB bulk chunks (mainline MAX_USBFS_BUFFER_SIZE) + micro-pacing
+        //      every ~256KB instead of large/continuous URB bursts
+        //   5. the external-shutter watch slows from 800ms to 3s polling
+        // Every step is persisted BEFORE it runs, so if the driver still panics
+        // the phone, the step it died on survives the reboot (lastCrashStep).
+        private const val SAFE_MODE_SETTLE_MS = 600L           // after claim, before 1st transaction
+        private const val SAFE_MODE_PRE_OPEN_SETTLE_MS = 1000L  // grant → openDevice
+        private const val SAFE_MODE_CLAIM_RETRY_SETTLE_MS = 400L // polite claim fail → force
+        private const val SAFE_MODE_HANDSHAKE_GAP_MS = 300L     // GetDeviceInfo → OpenSession
+        private const val SAFE_CHUNK_BYTES = 16 * 1024          // per-URB read size (safe mode)
+        private const val FAST_CHUNK_BYTES = 64 * 1024          // per-URB read size (fast mode)
+        private const val SAFE_PACE_EVERY_CHUNKS = 16           // pacing sleep every N chunks (~256KB)
+        private const val SAFE_PACE_SLEEP_MS = 4L
+        private const val SAFE_WATCH_POLL_MS = 3000L             // safe-mode watch interval
+        private const val CRASH_HINT_WINDOW_MS = 30 * 60_000L   // reboot-forensics window
         private const val PREFS_NAME = "ptp_camera_prefs"
         private const val PREF_USB_SAFE_MODE = "usbSafeMode"
+        private const val PREF_DIAG_STEP = "usbDiagStep"
+        private const val PREF_DIAG_AT = "usbDiagAt"
 
         // Shared across manager instances (Operator/Admin each create one) —
         // a single static flow + one-time prefs read keeps every instance in
@@ -182,11 +203,9 @@ class PTPCameraManager(private val context: Context) {
     /**
      * USB safe mode — workaround for phones whose USB host driver panics and
      * reboots the device during PTP transfers (seen on some Unisoc/MediaTek
-     * phones with Sony cameras). While ON (default):
-     *  - the interrupt endpoint is NEVER read (events come from the
-     *    GetObjectHandles diff instead — works on every camera)
-     *  - the first transaction waits [SAFE_MODE_SETTLE_MS] after claiming the
-     *    interface, letting the kernel settle
+     * phones with Sony cameras). While ON (default): no interrupt reads,
+     * polite-then-forced interface claim with settle delays, 16KB paced bulk
+     * chunks and a 3s watch. See the companion-object block for the full list.
      * Persisted per device; shared by every PTPCameraManager instance.
      */
     val usbSafeMode: StateFlow<Boolean> get() = _usbSafeMode.asStateFlow()
@@ -197,7 +216,70 @@ class PTPCameraManager(private val context: Context) {
         context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             .edit().putBoolean(PREF_USB_SAFE_MODE, enabled).apply()
         Log.i(TAG, "USB safe mode: $enabled" +
-                if (enabled) " — interrupt reads OFF, diff-only + settle delay" else " — interrupt endpoint enabled")
+                if (enabled) " — no interrupt reads, polite claim, 16KB paced chunks, 3s watch" else " — interrupt endpoint + fast path enabled")
+    }
+
+    /**
+     * Live human-readable progress of the USB connection ("membuka perangkat
+     * USB…", "handshake OpenSession…", "siap — transfer USB aktif"). Recorded
+     * BEFORE each risky kernel operation and persisted, so if the phone's USB
+     * driver panics and reboots the phone, the step it died on survives the
+     * reboot (surfaced via [lastCrashStep] on the next start).
+     */
+    private val _usbDiag = MutableStateFlow<String?>(null)
+    val usbDiag: StateFlow<String?> = _usbDiag.asStateFlow()
+
+    /**
+     * Non-null right after startup when the previous run died in the middle of
+     * a USB operation (persisted step + timestamp within the last
+     * [CRASH_HINT_WINDOW_MS]) — i.e. the phone most likely REBOOTED during that
+     * step. Surfaced in the UI so the user can report the exact failing op.
+     */
+    private val _lastCrashStep = MutableStateFlow<String?>(null)
+    val lastCrashStep: StateFlow<String?> = _lastCrashStep.asStateFlow()
+
+    /** Raw step id → user-facing Indonesian text. */
+    private fun diagText(step: String): String = when (step) {
+        "izin" -> "meminta izin akses USB"
+        "buka" -> "membuka perangkat USB"
+        "klaim" -> "mengklaim interface USB"
+        "deviceinfo" -> "handshake GetDeviceInfo"
+        "opensession" -> "handshake OpenSession"
+        "unduh" -> "mengunduh foto"
+        "capture" -> "capture dari aplikasi"
+        "siap" -> "siap — transfer USB aktif"
+        else -> "menunggu kabel USB"
+    }
+
+    /**
+     * Record the USB pipeline step BEFORE performing it (a panic mid-op leaves
+     * the step on disk). Persisted in SharedPreferences — survives the reboot,
+     * read back by [detectPriorCrash] on the next start.
+     */
+    private fun setDiag(step: String) {
+        _usbDiag.value = diagText(step)
+        try {
+            context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
+                .putString(PREF_DIAG_STEP, step)
+                .putLong(PREF_DIAG_AT, System.currentTimeMillis())
+                .apply()
+        } catch (_: Exception) {}
+    }
+
+    /** After a reboot: if the last persisted step was mid-operation and recent,
+     *  the phone died during it — surface that step for the user to report. */
+    private fun detectPriorCrash() {
+        try {
+            val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            val step = prefs.getString(PREF_DIAG_STEP, "idle") ?: "idle"
+            val at = prefs.getLong(PREF_DIAG_AT, 0L)
+            val midOp = step.isNotBlank() && step !in setOf("idle", "siap")
+            if (midOp && System.currentTimeMillis() - at < CRASH_HINT_WINDOW_MS) {
+                _lastCrashStep.value = diagText(step)
+                Log.w(TAG, "Previous run died mid-USB-op '$step' " +
+                        "${(System.currentTimeMillis() - at) / 1000}s ago — likely a USB-driver reboot")
+            }
+        } catch (_: Exception) {}
     }
 
     private fun usbSafeModeActive(): Boolean {
@@ -341,6 +423,9 @@ class PTPCameraManager(private val context: Context) {
 
         // Enumerate whatever is already plugged in
         scanDeviceList()
+        // Reboot forensics: if the previous run died mid-USB-op, surface it.
+        detectPriorCrash()
+        if (devices.isEmpty()) _usbDiag.value = diagText("idle")
         mainHandler.postDelayed(pollRunnable, USB_POLL_INTERVAL_MS)
     }
 
@@ -450,6 +535,7 @@ class PTPCameraManager(private val context: Context) {
                 PendingIntent.FLAG_UPDATE_CURRENT
             }
             val pi = PendingIntent.getBroadcast(context, device.deviceId, intent, flags)
+            setDiag("izin")
             usbManager.requestPermission(device, pi)
             Log.i(TAG, "Requested USB permission for ${device.deviceName}")
         } catch (e: Exception) {
@@ -529,11 +615,32 @@ class PTPCameraManager(private val context: Context) {
             try {
                 disconnectInternal()
 
+                // Safe mode: let the kernel finish settling the freshly granted
+                // device (auto-grant can fire within ~1s of plug) before we
+                // touch usbfs at all.
+                if (usbSafeModeActive()) {
+                    setDiag("buka")
+                    Thread.sleep(SAFE_MODE_PRE_OPEN_SETTLE_MS)
+                }
                 val conn = usbManager.openDevice(device)
                     ?: throw IllegalStateException("openDevice failed")
                 val itf = findPtpInterface(device)
                     ?: throw IllegalStateException("no PTP interface")
-                if (!conn.claimInterface(itf, true)) {
+                if (usbSafeModeActive()) {
+                    // Polite claim FIRST — force-unbinding an interface another
+                    // client/driver may be mid-handshake with is the classic
+                    // usbfs panic trigger. Force only as a settle-delayed
+                    // fallback when the polite claim is refused.
+                    setDiag("klaim")
+                    if (!conn.claimInterface(itf, false)) {
+                        Log.w(TAG, "Polite claimInterface refused — retrying with force after settle")
+                        Thread.sleep(SAFE_MODE_CLAIM_RETRY_SETTLE_MS)
+                        if (!conn.claimInterface(itf, true)) {
+                            conn.close()
+                            throw IllegalStateException("claimInterface failed")
+                        }
+                    }
+                } else if (!conn.claimInterface(itf, true)) {
                     conn.close()
                     throw IllegalStateException("claimInterface failed")
                 }
@@ -573,16 +680,21 @@ class PTPCameraManager(private val context: Context) {
                     Thread.sleep(SAFE_MODE_SETTLE_MS)
                 }
 
-                // Handshake: GetDeviceInfo (pre-session, txId 0) then OpenSession
+                // Handshake: GetDeviceInfo (pre-session, txId 0) then OpenSession —
+                // paced with gaps in safe mode, one step recorded at a time.
+                setDiag("deviceinfo")
                 val info = getDeviceInfo()
                     ?: throw IllegalStateException("GetDeviceInfo failed")
                 deviceManufacturer = info.manufacturer
                 deviceModel = info.model
                 if (info.operations.isNotEmpty()) supportedOperations = info.operations
 
+                if (usbSafeModeActive()) Thread.sleep(SAFE_MODE_HANDSHAKE_GAP_MS)
+                setDiag("opensession")
                 if (!openSession()) {
                     throw IllegalStateException("OpenSession failed")
                 }
+                setDiag("siap")
 
                 Log.i(TAG, "PTP session OPEN: $deviceManufacturer $deviceModel " +
                         "(ops=${supportedOperations.size}, interruptEP=${interruptEp != null})")
@@ -636,6 +748,9 @@ class PTPCameraManager(private val context: Context) {
             try {
                 conn.close()
             } catch (_: Exception) {}
+            // Clean close — clear the persisted step so a later unrelated
+            // reboot is not misreported as a USB crash.
+            setDiag("idle")
         }
         activeDevice = null
         activeDeviceId = -1
@@ -678,18 +793,30 @@ class PTPCameraManager(private val context: Context) {
         return bb.array()
     }
 
+    /** Per-URB read size — 16KB in safe mode (mainline kernel
+     *  MAX_USBFS_BUFFER_SIZE; big URBs are a known trigger on buggy host
+     *  drivers), 64KB in fast mode. */
+    private fun chunkLimit(): Int =
+        if (usbSafeModeActive()) SAFE_CHUNK_BYTES else FAST_CHUNK_BYTES
+
     /** Read exactly [length] bytes from the bulk IN endpoint into dst at [offset]. */
     private fun readBulk(dst: ByteArray, offset: Int, length: Int, timeoutMs: Int): Int {
         val conn = connection ?: return -1
         val ep = bulkInEp ?: return -1
         var total = 0
+        var chunks = 0
         while (total < length) {
-            val want = minOf(scratch.size, length - total)
+            val want = minOf(chunkLimit(), length - total)
             val n = conn.bulkTransfer(ep, scratch, want, timeoutMs)
             if (n < 0) return if (total > 0) total else -1
             if (n == 0) break
             System.arraycopy(scratch, 0, dst, offset + total, n)
             total += n
+            // Safe mode: micro-pause every ~256KB so buggy host controllers
+            // never see an unbroken stream of back-to-back URBs.
+            if (usbSafeModeActive() && ++chunks % SAFE_PACE_EVERY_CHUNKS == 0) {
+                try { Thread.sleep(SAFE_PACE_SLEEP_MS) } catch (_: InterruptedException) {}
+            }
         }
         return total
     }
@@ -717,8 +844,9 @@ class PTPCameraManager(private val context: Context) {
             val data = ByteArrayOutputStream()
             val conn = connection ?: return null
             val ep = bulkInEp ?: return null
+            var streamChunks = 0
             while (true) {
-                val n = conn.bulkTransfer(ep, scratch, scratch.size, timeoutMs)
+                val n = conn.bulkTransfer(ep, scratch, chunkLimit(), timeoutMs)
                 if (n <= 0) break
                 if (n >= 12) {
                     val pb = ByteBuffer.wrap(scratch, 0, 12).order(ByteOrder.LITTLE_ENDIAN)
@@ -734,6 +862,9 @@ class PTPCameraManager(private val context: Context) {
                     }
                 }
                 data.write(scratch, 0, n)
+                if (usbSafeModeActive() && ++streamChunks % SAFE_PACE_EVERY_CHUNKS == 0) {
+                    try { Thread.sleep(SAFE_PACE_SLEEP_MS) } catch (_: InterruptedException) {}
+                }
             }
             // Timed out without a response container — return what we have
             return Container(-1, CONTAINER_DATA, code, txId, data.toByteArray())
@@ -932,12 +1063,14 @@ class PTPCameraManager(private val context: Context) {
                 null
             }
             isCapturing = false
+            if (connection != null && sessionOpen) setDiag("siap")
             mainHandler.post { onResult(result) }
         }
     }
 
     private fun performCapture(): String? {
         Log.i(TAG, "performCapture: start ($deviceManufacturer $deviceModel)")
+        setDiag("capture")
 
         // 1) Snapshot existing object handles (for the no-interrupt-EP fallback)
         val preHandles = objectHandles() ?: emptySet()
@@ -1044,6 +1177,7 @@ class PTPCameraManager(private val context: Context) {
         addedHandles.forEach { rememberExternalHandle(it) }
 
         // 6) Download the photo
+        setDiag("unduh")
         val jpeg = getObject(handle)
         if (jpeg == null || jpeg.size < 4 ||
             jpeg[0] != 0xFF.toByte() || jpeg[1] != 0xD8.toByte() || jpeg[2] != 0xFF.toByte()
@@ -1170,7 +1304,11 @@ class PTPCameraManager(private val context: Context) {
                 Log.e(TAG, "watchStep: ${e.message}")
             }
             if (externalWatchEnabled) {
-                ioHandler.postDelayed(this, EXTERNAL_WATCH_POLL_MS)
+                // Safe mode: 3s cadence instead of 800ms — the constant
+                // background polling itself is a load the buggy host drivers
+                // can choke on over hours of an event.
+                ioHandler.postDelayed(this,
+                    if (usbSafeModeActive()) SAFE_WATCH_POLL_MS else EXTERNAL_WATCH_POLL_MS)
             }
         }
     }
@@ -1243,6 +1381,7 @@ class PTPCameraManager(private val context: Context) {
                 "(${info.compressedSize} B, fmt=0x${"%04X".format(info.format)})")
 
         // Download — the file may still be flushing to the card, so retry briefly
+        setDiag("unduh")
         var jpeg: ByteArray? = null
         for (attempt in 0 until 3) {
             jpeg = try { getObject(handle) } catch (e: Exception) { null }
@@ -1253,16 +1392,19 @@ class PTPCameraManager(private val context: Context) {
         if (jpeg == null || jpeg.size < 4 ||
             jpeg[0] != 0xFF.toByte() || jpeg[1] != 0xD8.toByte() || jpeg[2] != 0xFF.toByte()) {
             Log.w(TAG, "External object $handle: not a JPEG (${jpeg?.size ?: 0} bytes) — skipped")
+            if (connection != null && sessionOpen) setDiag("siap")
             return
         }
 
         val bitmap = decodeDownscaled(jpeg) ?: run {
             Log.w(TAG, "External object $handle: decode failed — skipped")
+            if (connection != null && sessionOpen) setDiag("siap")
             return
         }
         val dataUrl = try { CameraCapture.bitmapToBase64(bitmap, 95) } finally { bitmap.recycle() }
         Log.i(TAG, "External shutter photo delivered (${dataUrl.length} chars)")
         _externalShutterPhotos.tryEmit(dataUrl)
+        if (connection != null && sessionOpen) setDiag("siap")
     }
 
     /** Record a handle as recently-seen (IO thread only) — prune + bounded size. */

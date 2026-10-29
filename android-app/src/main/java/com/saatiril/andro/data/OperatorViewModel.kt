@@ -288,6 +288,12 @@ class OperatorViewModel(application: Application) : AndroidViewModel(application
 
     fun setUsbSafeMode(enabled: Boolean) = ptpCameraManager.setUsbSafeMode(enabled)
 
+    /** Live USB pipeline step, user-facing Indonesian (diagnostics) — see PTPCameraManager.usbDiag. */
+    val usbDiag: StateFlow<String?> get() = ptpCameraManager.usbDiag
+
+    /** Step the previous run died on, when the phone rebooted mid-USB-op — see PTPCameraManager.lastCrashStep. */
+    val lastUsbCrashStep: StateFlow<String?> get() = ptpCameraManager.lastCrashStep
+
 
     init {
         // Keep the hoisted flow in sync with whichever engine is active.

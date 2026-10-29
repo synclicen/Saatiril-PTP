@@ -123,6 +123,8 @@ fun AdminOperatorScreen(viewModel: AdminViewModel, modifier: Modifier = Modifier
     val ftpLastError by viewModel.ftpManager.lastError.collectAsState()
     val physicalShutterSync by viewModel.physicalShutterSync.collectAsState()
     val usbSafeMode by viewModel.usbSafeMode.collectAsState()
+    val usbDiag by viewModel.usbDiag.collectAsState()
+    val lastUsbCrashStep by viewModel.lastUsbCrashStep.collectAsState()
     val frameBitmap by viewModel.frameBitmap.collectAsState()
     var showCameraPicker by remember { mutableStateOf(false) }
 
@@ -1207,6 +1209,15 @@ fun AdminOperatorScreen(viewModel: AdminViewModel, modifier: Modifier = Modifier
                     )
                 }
             }
+            // Live USB pipeline diagnostics + reboot forensics (PTP only)
+            if (activeEngine == "ptp") {
+                usbDiag?.let { d ->
+                    Text("USB: $d", style = TextStyle(color = MUTED, fontSize = 8.sp), modifier = Modifier.fillMaxWidth())
+                }
+                lastUsbCrashStep?.let { c ->
+                    Text("⚠ Ponsel terakhir restart saat: $c — laporkan kalau terulang", style = TextStyle(color = RED, fontSize = 8.sp, fontWeight = FontWeight.Bold), modifier = Modifier.fillMaxWidth())
+                }
+            }
             // Row 2: Shutter button + Queue toggle + Settings toggle
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp), verticalAlignment = Alignment.CenterVertically) {
                 val shutterLabel = when {
@@ -1232,6 +1243,7 @@ fun AdminOperatorScreen(viewModel: AdminViewModel, modifier: Modifier = Modifier
                         Column(Modifier.weight(1f)) {
                             Text("Menunggu foto dari kamera…", style = TextStyle(color = CYAN, fontSize = 9.sp, fontWeight = FontWeight.Bold))
                             Text("FTP ${ftpServerAddress ?: "—"} ${if (ftpClientConnected) "• kamera terhubung" else "• menunggu kamera"}", style = TextStyle(color = MUTED, fontSize = 8.sp))
+                            if (!ftpClientConnected) Text("Gagal connect? Hotspot HP harus WPA2 (bukan WPA3), kamera satu jaringan, port 2121", style = TextStyle(color = MUTED, fontSize = 8.sp))
                             ftpLastFile?.let { f -> Text("Terakhir: $f", style = TextStyle(color = MUTED, fontSize = 8.sp)) }
                             ftpLastError?.let { e -> Text(e, style = TextStyle(color = RED, fontSize = 8.sp)) }
                         }
