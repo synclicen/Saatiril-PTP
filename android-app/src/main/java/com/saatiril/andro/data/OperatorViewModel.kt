@@ -570,7 +570,7 @@ class OperatorViewModel(application: Application) : AndroidViewModel(application
         val uvcList = cameraUVCManager.availableCameras.value
         val c2List = camera2Manager.availableCameras.value
         _allAvailableCameras.value = ptpList + uvcList + c2List +
-            listOf("ftp:wifi" to "Transfer WiFi (FTP)")
+            listOf("ftp:wifi" to "Transfer Kabel/WiFi (FTP)")
     }
 
     fun switchCamera() {

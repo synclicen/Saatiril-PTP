@@ -188,7 +188,7 @@ class AdminViewModel(application: Application) : AndroidViewModel(application) {
         val uvcList = cameraUVCManager.availableCameras.value
         val c2List = camera2Manager.availableCameras.value
         _availableCameras.value = ptpList + uvcList + c2List +
-            listOf("ftp:wifi" to "Transfer WiFi (FTP)")
+            listOf("ftp:wifi" to "Transfer Kabel/WiFi (FTP)")
     }
 
     /** Switch to a specific camera by ID (handles PTP, UVC, and Camera2). */

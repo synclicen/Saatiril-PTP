@@ -167,6 +167,7 @@ fun OperatorCameraScreen(
     // the connected-dot + the passive status card below read off the manager.
     val ftpClientConnected by opViewModel.ftpManager.clientConnected.collectAsState()
     val ftpServerAddress by opViewModel.ftpManager.serverAddress.collectAsState()
+    val ftpTetherAddress by opViewModel.ftpManager.tetherAddress.collectAsState()
     val ftpLastFile by opViewModel.ftpManager.lastFile.collectAsState()
     val ftpLastError by opViewModel.ftpManager.lastError.collectAsState()
     val cameraConnected = when (activeEngine) { "uvc" -> uvcConnected; "camera2" -> c2Connected; "ftp" -> ftpClientConnected; else -> ptpConnected }
@@ -678,23 +679,32 @@ fun OperatorCameraScreen(
                 }
                 val canCapture = currentTarget != null && capturePhase != CapturePhase.SENDING && !isSending && timerCountdown == 0
                 if (cameraSource == "ftp") {
-                    // WiFi (FTP) transfer mode — passive status card replaces the
+                    // Network (FTP) transfer mode — passive status card replaces the
                     // shutter button: photos are taken with the camera's OWN
-                    // shutter button and arrive over WiFi, there is nothing to
-                    // trigger app-side (same visual language as the PTP rows above).
+                    // shutter button and arrive over the cable (USB tethering) or
+                    // WiFi, there is nothing to trigger app-side (same visual
+                    // language as the PTP rows above).
                     Row(
                         modifier = Modifier.weight(1f).heightIn(min = 48.dp).clip(RoundedCornerShape(4.dp))
                             .background(CARD)
-                            .border(1.dp, CYAN, RoundedCornerShape(4.dp))
+                            .border(1.dp, if (ftpTetherAddress != null) GREEN else CYAN, RoundedCornerShape(4.dp))
                             .padding(horizontal = 8.dp, vertical = 4.dp),
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
-                        Icon(Icons.Default.Wifi, contentDescription = null, tint = CYAN, modifier = Modifier.size(16.dp))
+                        Icon(if (ftpTetherAddress != null) Icons.Default.Usb else Icons.Default.Wifi,
+                            contentDescription = null, tint = if (ftpTetherAddress != null) GREEN else CYAN,
+                            modifier = Modifier.size(16.dp))
                         Column(Modifier.weight(1f)) {
-                            Text("Menunggu foto dari kamera…", style = TextStyle(color = CYAN, fontSize = 9.sp, fontWeight = FontWeight.Bold))
+                            Text("Menunggu foto dari kamera…", style = TextStyle(color = if (ftpTetherAddress != null) GREEN else CYAN, fontSize = 9.sp, fontWeight = FontWeight.Bold))
                             Text("FTP ${ftpServerAddress ?: "—"} ${if (ftpClientConnected) "• kamera terhubung" else "• menunggu kamera"}", style = TextStyle(color = MUTED, fontSize = 8.sp))
-                            if (!ftpClientConnected) Text("Gagal connect? Hotspot HP harus WPA2 (bukan WPA3), kamera satu jaringan, port 2121", style = TextStyle(color = MUTED, fontSize = 8.sp))
+                            if (ftpTetherAddress != null) {
+                                Text("KABEL USB aktif — foto masuk lewat kabel (USB-C)", style = TextStyle(color = GREEN, fontSize = 8.sp, fontWeight = FontWeight.Bold))
+                                Text("Kamera: FTP Server 1 → Host = ${ftpTetherAddress}, Port 2121, Auto Transfer On", style = TextStyle(color = MUTED, fontSize = 8.sp))
+                            } else if (!ftpClientConnected) {
+                                Text("Mode kabel (disarankan): kamera MENU → Network → USB-LAN/Tethering → Tethering Connection → colok USB-C → ponsel: aktifkan USB/Ethernet tethering", style = TextStyle(color = MUTED, fontSize = 8.sp))
+                                Text("Mode WiFi: hotspot HP WPA2 (bukan WPA3), kamera satu jaringan, port 2121", style = TextStyle(color = MUTED, fontSize = 8.sp))
+                            }
                             ftpLastFile?.let { f -> Text("Terakhir: $f", style = TextStyle(color = MUTED, fontSize = 8.sp)) }
                             ftpLastError?.let { e -> Text(e, style = TextStyle(color = RED, fontSize = 8.sp)) }
                         }

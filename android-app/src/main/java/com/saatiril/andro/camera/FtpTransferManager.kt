@@ -26,20 +26,29 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
- * FtpTransferManager — fourth photo input engine: WiFi transfer, no USB.
+ * FtpTransferManager — fourth photo input engine: network transfer, no usbfs.
  *
  * The camera (e.g. Sony a7 IV with built-in "FTP Transfer Function") is set to
  * auto-upload every shot to an FTP server. This class IS that server, running
- * inside the operator/admin app on the same phone (typically on the phone's own
- * hotspot, so it works fully offline at the venue).
+ * inside the operator/admin app on the same phone. Two supported links:
+ *
+ *  • CABLE (recommended, v2.8.0): the camera's "USB-LAN/Tethering → Tethering
+ *    Connection" mode runs an IP network over the USB-C cable (official Sony
+ *    feature, documented in the a7 IV FTP Help Guide). Android bridges it via
+ *    the USB/Ethernet tethering toggle and the camera uploads over the CABLE.
+ *    No PTP/MTP bulk traffic ever touches usbfs — the kernel-panic trigger on
+ *    reboot-prone phones — while the photographer still fires the camera's
+ *    OWN physical shutter button.
+ *  • WiFi (v2.7.3 fallback): the phone's hotspot (WPA2), camera joins and
+ *    uploads over the air. Works fully offline at the venue.
  *
  * Why this exists: on some phones the USB host driver panics and reboots the
  * phone during PTP/MTP transfers (kernel-level bug — no app fix possible, even
- * with USB safe mode). WiFi removes the cable from the equation entirely:
+ * with USB safe mode). Both links above remove usbfs from the equation:
  * the photographer just presses the camera's OWN shutter button, the photo
- * arrives here over WiFi, and is emitted on [ftpPhotos] in the exact same
- * shape as PTPCameraManager.externalShutterPhotos — so the existing pipeline
- * (frame overlay, phase gating, delivery) is reused unchanged.
+ * arrives here, and is emitted on [ftpPhotos] in the exact same shape as
+ * PTPCameraManager.externalShutterPhotos — so the existing pipeline (frame
+ * overlay, phase gating, delivery) is reused unchanged.
  *
  * FTP subset implemented (deliberately tolerant — the camera drives, we accept):
  *   USER/PASS (any credentials), SYST, FEAT, OPTS, PWD, CWD, CDUP, TYPE A/I,
@@ -89,9 +98,17 @@ class FtpTransferManager(private val context: Context) {
     val clientConnected: StateFlow<Boolean> = _clientConnected.asStateFlow()
 
     /** Best local address as "ip:port" (what to type into the camera), or
-     *  null while not running / no network. Prefers hotspot interfaces. */
+     *  null while not running / no network. Prefers the USB-tether interface
+     *  (cable mode), then hotspot, then any other up IPv4. */
     private val _serverAddress = MutableStateFlow<String?>(null)
     val serverAddress: StateFlow<String?> = _serverAddress.asStateFlow()
+
+    /** Phone-side IP of the USB tether interface ("192.168.x.x"), or null while
+     *  no cable network is up. This is the address the camera's FTP server
+     *  must use in CABLE mode — surfaced by the UI so the user can type it
+     *  into the camera exactly once. */
+    private val _tetherAddress = MutableStateFlow<String?>(null)
+    val tetherAddress: StateFlow<String?> = _tetherAddress.asStateFlow()
 
     /** Last accepted JPEG filename (status card). */
     private val _lastFile = MutableStateFlow<String?>(null)
@@ -116,6 +133,10 @@ class FtpTransferManager(private val context: Context) {
     private val running = AtomicBoolean(false)
     private var serverSocket: ServerSocket? = null
     private var acceptThread: Thread? = null
+    /** Low-frequency monitor: keeps [serverAddress]/[tetherAddress] fresh so
+     *  the tether IP shows up the moment the user flips USB/Ethernet tethering
+     *  (instead of only when the camera finally connects). */
+    private var addressMonitorThread: Thread? = null
     private val openConnections = AtomicInteger(0)
 
     /** Single-threaded processor: decode + emit completed transfers one at a
@@ -156,6 +177,17 @@ class FtpTransferManager(private val context: Context) {
         refreshServerAddress()
         Log.i(TAG, "FTP server listening on $FTP_PORT — address=${_serverAddress.value}")
 
+        // Keep the advertised address fresh (tether up/down, hotspot on/off)
+        // without waiting for a client to knock. 5 s is plenty responsive and
+        // costs nothing (one interface enumeration per tick).
+        addressMonitorThread = Thread({
+            while (running.get()) {
+                try { Thread.sleep(5_000) } catch (_: InterruptedException) { break }
+                if (!running.get()) break
+                refreshServerAddress()
+            }
+        }, "FtpAddrMonitor").apply { isDaemon = true; start() }
+
         acceptThread = Thread({
             while (running.get()) {
                 val client: Socket = try {
@@ -181,9 +213,12 @@ class FtpTransferManager(private val context: Context) {
         _isRunning.value = false
         _clientConnected.value = false
         _serverAddress.value = null
+        _tetherAddress.value = null
         try { serverSocket?.close() } catch (_: IOException) {}
         serverSocket = null
         acceptThread = null
+        try { addressMonitorThread?.interrupt() } catch (_: Exception) {}
+        addressMonitorThread = null
         Log.i(TAG, "FTP server stopped")
     }
 
@@ -199,6 +234,8 @@ class FtpTransferManager(private val context: Context) {
 
     private fun refreshServerAddress() {
         try {
+            val tether = tetherIPv4()
+            _tetherAddress.value = tether?.hostAddress
             val addr = bestLocalIPv4()
             _serverAddress.value = if (addr != null) "${addr.hostAddress}:$FTP_PORT" else null
         } catch (e: Exception) {
@@ -206,9 +243,37 @@ class FtpTransferManager(private val context: Context) {
         }
     }
 
-    /** Prefer hotspot/soft-AP interfaces (the phone shares its connection to
-     *  the camera), then any other up IPv4. */
+    /** IPv4 of the USB tether interface (the cable link to the camera), or
+     *  null. Interface names: usb0/rndis0/ncm0/ecm0 — Android creates one of
+     *  these the moment USB (or Ethernet) tethering is enabled with the camera
+     *  attached. No permissions needed for NetworkInterface enumeration. */
+    private fun tetherIPv4(): InetAddress? {
+        val nis: java.util.Enumeration<NetworkInterface> =
+            try { NetworkInterface.getNetworkInterfaces() } catch (e: Exception) { null }
+                ?: return null
+        for (ni in nis) {
+            try {
+                if (!ni.isUp || ni.isLoopback) continue
+                val name = ni.name.lowercase()
+                val isTether = name.contains("usb") || name.contains("rndis") ||
+                        name.contains("ncm") || name.contains("ecm")
+                if (!isTether) continue
+                for (ia in ni.inetAddresses) {
+                    if (ia.isLoopbackAddress) continue
+                    if (ia.hostAddress?.contains('.') == true) return ia
+                }
+            } catch (_: Exception) {
+                // interface went away between calls — skip it
+            }
+        }
+        return null
+    }
+
+    /** Prefer the USB-tether interface (CABLE mode — the recommended link on
+     *  phones that reboot on usbfs PTP), then hotspot/soft-AP interfaces (the
+     *  phone shares its connection to the camera), then any other up IPv4. */
     private fun bestLocalIPv4(): InetAddress? {
+        var tetherCandidate: InetAddress? = null
         var apCandidate: InetAddress? = null
         var anyCandidate: InetAddress? = null
         val nis: java.util.Enumeration<NetworkInterface> =
@@ -218,10 +283,13 @@ class FtpTransferManager(private val context: Context) {
             try {
                 if (!ni.isUp || ni.isLoopback) continue
                 val name = ni.name.lowercase()
+                val isTether = name.contains("usb") || name.contains("rndis") ||
+                        name.contains("ncm") || name.contains("ecm")
                 val isAp = name.contains("ap") || name.contains("swlan") || name.contains("softap")
                 for (ia in ni.inetAddresses) {
                     if (ia.isLoopbackAddress) continue
                     if (ia.hostAddress?.contains('.') != true) continue // IPv4 only
+                    if (isTether && tetherCandidate == null) tetherCandidate = ia
                     if (isAp && apCandidate == null) apCandidate = ia
                     if (anyCandidate == null) anyCandidate = ia
                 }
@@ -229,7 +297,7 @@ class FtpTransferManager(private val context: Context) {
                 // interface went away between calls — skip it
             }
         }
-        return apCandidate ?: anyCandidate
+        return tetherCandidate ?: apCandidate ?: anyCandidate
     }
 
     // ══════════════════════════════════════════════════════════════
