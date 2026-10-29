@@ -23,8 +23,12 @@ import android.os.HandlerThread
 import android.os.Looper
 import android.util.Log
 import android.view.TextureView
+import kotlinx.coroutines.channels.BufferOverflow
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
@@ -98,6 +102,11 @@ class PTPCameraManager(private val context: Context) {
         private const val DECODE_MAX_EDGE = 2560       // downscale huge DSLR JPEGs
         private const val USB_POLL_INTERVAL_MS = 2000L // attach/detach polling fallback
 
+        // ── External shutter watch (physical camera button sync) ──
+        private const val EXTERNAL_WATCH_POLL_MS = 800L    // watch pass interval
+        private const val EXTERNAL_SHOT_COOLDOWN_MS = 2500L // burst/bracket protection
+        private const val EXTERNAL_RECENT_MS = 15_000L      // handle-dedupe window
+
         // Camera VIDs that expose PTP on vendor-specific interfaces
         // (class 0xFF) on older bodies — used only as a detection fallback.
         private val CAMERA_VENDORS = setOf(
@@ -143,6 +152,18 @@ class PTPCameraManager(private val context: Context) {
     private val _lastError = MutableStateFlow<String?>(null)
     val lastError: StateFlow<String?> = _lastError.asStateFlow()
 
+    /**
+     * Photos taken with the camera's OWN physical shutter button while a PTP
+     * session is open. The camera stores the shot on its card AND exposes the
+     * new object over PTP (ObjectAdded event on the interrupt endpoint /
+     * GetObjectHandles diff) — [externalShutterPhotos] watch downloads it and
+     * emits the processed base64 data URL here, so a physical shutter press
+     * behaves exactly like pressing the app's shutter button.
+     */
+    private val _externalShutterPhotos = MutableSharedFlow<String>(
+        extraBufferCapacity = 4, onBufferOverflow = BufferOverflow.DROP_OLDEST)
+    val externalShutterPhotos: SharedFlow<String> = _externalShutterPhotos.asSharedFlow()
+
     // ══════════════════════════════════════════════════════════════
     // USB plumbing
     // ══════════════════════════════════════════════════════════════
@@ -180,6 +201,14 @@ class PTPCameraManager(private val context: Context) {
 
     @Volatile private var isCapturing = false
     @Volatile private var initialized = false
+
+    // ── External shutter watch state (IO thread only) ──
+    @Volatile private var externalWatchEnabled = false
+    /** Baseline object-handle set for the diff path (IO thread only). */
+    private var knownHandles: Set<Int>? = null
+    /** Handles recently delivered/seen — dedupes event+diff paths and app captures. */
+    private val recentExternalHandles = ArrayDeque<Pair<Int, Long>>()
+    private var lastExternalPhotoAt = 0L
 
     /** Single serialized IO thread — PTP transactions are strictly sequential. */
     private val ioThread: HandlerThread = HandlerThread("PTP-IO").apply { start() }
@@ -563,6 +592,8 @@ class PTPCameraManager(private val context: Context) {
     fun destroy() {
         Log.i(TAG, "destroy")
         initialized = false
+        externalWatchEnabled = false
+        ioHandler.removeCallbacks(watchRunnable)
         mainHandler.removeCallbacks(pollRunnable)
         try { context.unregisterReceiver(deviceReceiver) } catch (_: Exception) {}
         try { context.unregisterReceiver(permissionReceiver) } catch (_: Exception) {}
@@ -948,6 +979,10 @@ class PTPCameraManager(private val context: Context) {
         val handle = bestHandle ?: addedHandles.last()
         Log.i(TAG, "Selected object handle=$handle (${addedHandles.size} candidate(s))")
 
+        // Register every candidate handle so the external shutter watch does
+        // not re-deliver this same photo when it appears in the handle diff.
+        addedHandles.forEach { rememberExternalHandle(it) }
+
         // 6) Download the photo
         val jpeg = getObject(handle)
         if (jpeg == null || jpeg.size < 4 ||
@@ -1039,9 +1074,148 @@ class PTPCameraManager(private val context: Context) {
             BitmapFactory.Options().apply { inSampleSize = sample })
     }
 
-    // ══════════════════════════════════════════════════════════════
+    // ══════════════════════════════════════════════════════════
+    // External shutter watch — physical camera button sync
+    // ══════════════════════════════════════════════════════════
+
+    /**
+     * Start watching for photos taken with the camera's own physical shutter
+     * button. Each detected shot is downloaded (≤2560px, q95) and emitted on
+     * [externalShutterPhotos]. Idempotent.
+     */
+    fun startExternalShutterWatch() {
+        if (externalWatchEnabled) return
+        externalWatchEnabled = true
+        knownHandles = null  // fresh baseline — never deliver pre-existing objects
+        ioHandler.removeCallbacks(watchRunnable)
+        ioHandler.post(watchRunnable)
+        Log.i(TAG, "External shutter watch STARTED — camera's own shutter button now syncs photos")
+    }
+
+    /** Stop the physical-shutter watch. Idempotent. */
+    fun stopExternalShutterWatch() {
+        if (!externalWatchEnabled) return
+        externalWatchEnabled = false
+        ioHandler.removeCallbacks(watchRunnable)
+        Log.i(TAG, "External shutter watch stopped")
+    }
+
+    /** Self-reposting poll on the IO thread — interleaves with transactions. */
+    private val watchRunnable = object : Runnable {
+        override fun run() {
+            if (!externalWatchEnabled) return
+            try {
+                watchStep()
+            } catch (e: Exception) {
+                Log.e(TAG, "watchStep: ${e.message}")
+            }
+            if (externalWatchEnabled) {
+                ioHandler.postDelayed(this, EXTERNAL_WATCH_POLL_MS)
+            }
+        }
+    }
+
+    /** One watch pass — runs on the IO thread between transactions. */
+    private fun watchStep() {
+        if (connection == null || !sessionOpen) {
+            knownHandles = null
+            return
+        }
+        if (isCapturing) return  // performCapture handles its own events
+
+        // 1) Drain pending interrupt events (short timeouts, small budget)
+        if (interruptEp != null) {
+            var drained = 0
+            while (drained < 4) {
+                val ev = readEvent(50) ?: break
+                drained++
+                if (ev.code == EV_OBJECT_ADDED && ev.params.isNotEmpty()) {
+                    onExternalObject(ev.params[0])
+                }
+            }
+        }
+
+        // 2) GetObjectHandles diff — universal fallback (also catches cameras
+        //    that don't emit events to an idle host)
+        val nowHandles = objectHandles() ?: return
+        val base = knownHandles
+        if (base == null) {
+            knownHandles = nowHandles
+            return
+        }
+        val fresh = nowHandles - base
+        knownHandles = nowHandles
+        for (h in fresh) onExternalObject(h)
+    }
+
+    /**
+     * A new object appeared that the app did not request — probably a shot
+     * taken with the camera's physical shutter button. Download + emit it.
+     */
+    private fun onExternalObject(handle: Int) {
+        val now = System.currentTimeMillis()
+
+        // Dedupe: this handle was already processed recently (the event path
+        // and the diff path can both report the same object)
+        if (recentExternalHandles.any { it.first == handle }) return
+
+        // Only JPEG-ish objects (ignore RAW/MP4 siblings of the same shot)
+        val info = try { getObjectInfo(handle) } catch (e: Exception) { null }
+        if (info == null) { rememberExternalHandle(handle); return }
+        val isJpeg = info.format == FMT_EXIF_JPEG || info.format == FMT_JFIF ||
+            info.filename.uppercase().endsWith(".JPG") ||
+            info.filename.uppercase().endsWith(".JPEG")
+        if (!isJpeg) { rememberExternalHandle(handle); return }
+
+        // Cooldown — bursts/brackets produce several objects; deliver the first only
+        if (now - lastExternalPhotoAt < EXTERNAL_SHOT_COOLDOWN_MS) {
+            rememberExternalHandle(handle)
+            Log.d(TAG, "External object $handle skipped (cooldown)")
+            return
+        }
+        rememberExternalHandle(handle)
+        lastExternalPhotoAt = now
+
+        Log.i(TAG, "External shutter shot: handle=$handle file=${info.filename} " +
+                "(${info.compressedSize} B, fmt=0x${"%04X".format(info.format)})")
+
+        // Download — the file may still be flushing to the card, so retry briefly
+        var jpeg: ByteArray? = null
+        for (attempt in 0 until 3) {
+            jpeg = try { getObject(handle) } catch (e: Exception) { null }
+            if (jpeg != null && jpeg.size > 4 &&
+                jpeg[0] == 0xFF.toByte() && jpeg[1] == 0xD8.toByte() && jpeg[2] == 0xFF.toByte()) break
+            Thread.sleep(400)
+        }
+        if (jpeg == null || jpeg.size < 4 ||
+            jpeg[0] != 0xFF.toByte() || jpeg[1] != 0xD8.toByte() || jpeg[2] != 0xFF.toByte()) {
+            Log.w(TAG, "External object $handle: not a JPEG (${jpeg?.size ?: 0} bytes) — skipped")
+            return
+        }
+
+        val bitmap = decodeDownscaled(jpeg) ?: run {
+            Log.w(TAG, "External object $handle: decode failed — skipped")
+            return
+        }
+        val dataUrl = try { CameraCapture.bitmapToBase64(bitmap, 95) } finally { bitmap.recycle() }
+        Log.i(TAG, "External shutter photo delivered (${dataUrl.length} chars)")
+        _externalShutterPhotos.tryEmit(dataUrl)
+    }
+
+    /** Record a handle as recently-seen (IO thread only) — prune + bounded size. */
+    private fun rememberExternalHandle(handle: Int) {
+        val now = System.currentTimeMillis()
+        while (recentExternalHandles.isNotEmpty() &&
+            (now - recentExternalHandles.first().second > EXTERNAL_RECENT_MS ||
+                recentExternalHandles.size > 32)) {
+            recentExternalHandles.removeFirst()
+        }
+        recentExternalHandles.add(handle to now)
+    }
+
+    // ══════════════════════════════════════════════════════════
     // Preview placeholder (PTP has no live view)
-    // ══════════════════════════════════════════════════════════════
+    // ══════════════════════════════════════════════════════════
 
     fun setTextureView(tv: TextureView?) {
         textureView = tv

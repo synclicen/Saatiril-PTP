@@ -26,6 +26,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
@@ -122,6 +123,37 @@ class AdminViewModel(application: Application) : AndroidViewModel(application) {
     /** "uvc" / "builtin" / "ptp" / "none" — human-readable camera source label. */
     private val _cameraSource = MutableStateFlow<String>("builtin")
     val cameraSource: StateFlow<String> = _cameraSource.asStateFlow()
+
+    // ─── Physical shutter sync (PTP only) ─────────────────────
+    // When the PTP engine is active and this is ON, photos taken with the
+    // camera's OWN physical shutter button are detected over USB (PTPCameraManager
+    // external shutter watch) and downloaded. The AdminOperatorScreen delivers
+    // them through its LOCAL capture pipeline (handleLocalCapture) — this
+    // ViewModel only starts/stops the engine watch. Default ON (that's the
+    // whole point of PTP mode).
+    private val _physicalShutterSync = MutableStateFlow(true)
+    val physicalShutterSync: StateFlow<Boolean> = _physicalShutterSync.asStateFlow()
+
+    fun setPhysicalShutterSync(enabled: Boolean) {
+        _physicalShutterSync.value = enabled
+        Log.i(TAG, "Physical shutter sync: $enabled")
+    }
+
+    // Physical shutter sync — watch while PTP is connected AND enabled.
+    // NOTE: this is a SECOND init block placed AFTER the camera properties
+    // above. viewModelScope uses Dispatchers.Main.immediate, so a collector
+    // in the first init block (top of class, before ptpCameraManager is
+    // initialized) would access uninitialized properties.
+    init {
+        viewModelScope.launch {
+            combine(ptpCameraManager.isConnected, _physicalShutterSync) { conn, enabled ->
+                conn && enabled
+            }.collect { active ->
+                if (active) ptpCameraManager.startExternalShutterWatch()
+                else ptpCameraManager.stopExternalShutterWatch()
+            }
+        }
+    }
 
     /** Refresh the combined camera list from all engines (PTP + UVC + Camera2). */
     fun refreshAvailableCameras() {

@@ -115,6 +115,7 @@ fun AdminOperatorScreen(viewModel: AdminViewModel, modifier: Modifier = Modifier
     val uvcConnected by viewModel.cameraUVCManager.isConnected.collectAsState()
     val c2Connected by viewModel.camera2Manager.isConnected.collectAsState()
     val ptpConnected by viewModel.ptpCameraManager.isConnected.collectAsState()
+    val physicalShutterSync by viewModel.physicalShutterSync.collectAsState()
     val frameBitmap by viewModel.frameBitmap.collectAsState()
     var showCameraPicker by remember { mutableStateOf(false) }
 
@@ -275,6 +276,72 @@ fun AdminOperatorScreen(viewModel: AdminViewModel, modifier: Modifier = Modifier
     val currentProject by rememberUpdatedState(project)
     val currentFrameBitmap by rememberUpdatedState(frameBitmap)
 
+    // ── PTP photo delivery — shared by the on-screen capture path (below) and
+    // the physical-shutter watcher (further below). Decodes the full-res JPEG
+    // data URL, applies the project frame/filters, flashes, and routes the
+    // photo into the local capture pipeline. Always reads the CURRENT
+    // student/channel/project/frame via the rememberUpdatedState refs above
+    // (DSLR transfer takes seconds — values may change while in flight).
+    val deliverPtpPhoto: (String) -> Unit = { dataUrl ->
+        scope.launch(Dispatchers.Default) {
+            try {
+                val pure = if (dataUrl.contains(",")) dataUrl.substringAfter(",") else dataUrl
+                val bytes = Base64.decode(pure, Base64.DEFAULT)
+                val source = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                if (source == null) {
+                    captureError = "Gagal decode foto PTP"
+                    return@launch
+                }
+                val proj = currentProject
+                val processed = if (proj != null) {
+                    try { CameraCapture.processFrame(source, proj.config, currentFrameBitmap) } catch (e: Exception) { source }
+                } else source
+                val base64 = CameraCapture.bitmapToBase64(processed, 95)
+                if (processed !== source) processed.recycle()
+                source.recycle()
+                showFlash = true
+                scope.launch { delay(200); showFlash = false }
+                val student = currentActiveStudent
+                if (student != null) {
+                    viewModel.handleLocalCapture(student, base64, currentActiveChannel)
+                } else {
+                    captureError = "Tidak ada mahasiswa aktif"
+                }
+            } catch (e: Exception) {
+                captureError = "Gagal: ${e.message}"
+            } finally {
+                isCapturing = false
+            }
+        }
+    }
+
+    // ── Physical shutter sync (PTP) — photos taken with the camera's OWN
+    // shutter button arrive here over USB (PTPCameraManager external shutter
+    // watch) and are delivered through the SAME path as on-screen captures.
+    // Gated on: PTP engine active + the physical shutter toggle ON.
+    // - If an on-screen capture is already in flight → skip (photos would race).
+    // - If a countdown timer is running → CANCEL it first: the shot already
+    //   happened, letting the timer fire would double-capture.
+    LaunchedEffect(Unit) {
+        viewModel.ptpCameraManager.externalShutterPhotos.collect { dataUrl ->
+            if (viewModel.activeCameraEngine.value != "ptp") return@collect
+            if (!viewModel.physicalShutterSync.value) return@collect
+            if (isCapturing) {
+                Log.i("OperatorScreen", "External PTP photo skipped — capture already in flight")
+                return@collect
+            }
+            if (timerCountdown != null || timerJob != null) {
+                Log.i("OperatorScreen", "External PTP photo — cancelling countdown timer (double-capture guard)")
+                timerJob?.cancel()
+                timerJob = null
+                timerCountdown = null
+            }
+            Log.i("OperatorScreen", "External PTP photo (physical shutter) → delivering")
+            isCapturing = true
+            deliverPtpPhoto(dataUrl)
+        }
+    }
+
     // ── Hot shoe: extract the capture logic into a reusable lambda ──
     // (used by both the on-screen shutter button + the hot shoe audio detector).
     val triggerCapture: () -> Unit = {
@@ -294,36 +361,7 @@ fun AdminOperatorScreen(viewModel: AdminViewModel, modifier: Modifier = Modifier
                             isCapturing = false
                             return@capturePhoto
                         }
-                        scope.launch(Dispatchers.Default) {
-                            try {
-                                val pure = if (dataUrl.contains(",")) dataUrl.substringAfter(",") else dataUrl
-                                val bytes = Base64.decode(pure, Base64.DEFAULT)
-                                val source = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-                                if (source == null) {
-                                    captureError = "Gagal decode foto PTP"
-                                    return@launch
-                                }
-                                val proj = currentProject
-                                val processed = if (proj != null) {
-                                    try { CameraCapture.processFrame(source, proj.config, currentFrameBitmap) } catch (e: Exception) { source }
-                                } else source
-                                val base64 = CameraCapture.bitmapToBase64(processed, 95)
-                                if (processed !== source) processed.recycle()
-                                source.recycle()
-                                showFlash = true
-                                scope.launch { delay(200); showFlash = false }
-                                val student = currentActiveStudent
-                                if (student != null) {
-                                    viewModel.handleLocalCapture(student, base64, currentActiveChannel)
-                                } else {
-                                    captureError = "Tidak ada mahasiswa aktif"
-                                }
-                            } catch (e: Exception) {
-                                captureError = "Gagal: ${e.message}"
-                            } finally {
-                                isCapturing = false
-                            }
-                        }
+                        deliverPtpPhoto(dataUrl)
                     }
                 } else {
                     // Existing Camera2/UVC path — textureView bitmap grab
@@ -1072,6 +1110,34 @@ fun AdminOperatorScreen(viewModel: AdminViewModel, modifier: Modifier = Modifier
                     style = TextStyle(color = RED, fontSize = 8.sp),
                     modifier = Modifier.padding(horizontal = 6.dp)
                 )
+            }
+            // Row 1.7: Physical shutter sync (PTP only) — photos taken with the
+            // camera's OWN shutter button are detected over USB and delivered
+            // through the same local capture pipeline as the on-screen shutter.
+            // Gates ONLY external-photo delivery — the on-screen shutter button
+            // always works regardless of this toggle.
+            if (activeEngine == "ptp") {
+                Row(
+                    modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(4.dp))
+                        .background(if (physicalShutterSync) CARD else PANEL)
+                        .border(1.dp, if (physicalShutterSync) CYAN else BORDER, RoundedCornerShape(4.dp))
+                        .padding(horizontal = 8.dp, vertical = 2.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Icon(Icons.Default.PhotoCamera, contentDescription = null, tint = if (physicalShutterSync) CYAN else MUTED, modifier = Modifier.size(12.dp))
+                    Text("Shutter Kamera Fisik", style = TextStyle(color = if (physicalShutterSync) CYAN else MUTED, fontSize = 9.sp, fontWeight = FontWeight.Bold), modifier = Modifier.weight(1f))
+                    Switch(
+                        checked = physicalShutterSync,
+                        onCheckedChange = { viewModel.setPhysicalShutterSync(it) },
+                        colors = SwitchDefaults.colors(
+                            checkedThumbColor = CYAN,
+                            checkedTrackColor = CYAN.copy(alpha = 0.4f),
+                            uncheckedThumbColor = MUTED,
+                            uncheckedTrackColor = BORDER
+                        )
+                    )
+                }
             }
             // Row 2: Shutter button + Queue toggle + Settings toggle
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp), verticalAlignment = Alignment.CenterVertically) {

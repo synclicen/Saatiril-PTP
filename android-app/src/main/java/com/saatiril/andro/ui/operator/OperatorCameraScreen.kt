@@ -92,6 +92,7 @@ fun OperatorCameraScreen(
     val availableCameras by opViewModel.availableCameras.collectAsState()
     val activeEngine by opViewModel.activeCameraEngine.collectAsState()
     val cameraSource by opViewModel.cameraSource.collectAsState()
+    val physicalShutterSync by opViewModel.physicalShutterSync.collectAsState()
     val currentCameraId by opViewModel.currentCameraId.collectAsState()
     val gridlineSettings by opViewModel.gridlineSettings.collectAsState()
     val scope = rememberCoroutineScope()
@@ -538,6 +539,32 @@ fun OperatorCameraScreen(
                         Text(label, modifier = Modifier.padding(vertical = 4.dp, horizontal = 2.dp).fillMaxWidth(),
                             style = TextStyle(color = if (shutterMode == m) GOLD else MUTED, fontSize = 9.sp, fontWeight = FontWeight.Bold, textAlign = TextAlign.Center))
                     }
+                }
+            }
+            // Physical shutter sync (PTP only) — photos taken with the camera's
+            // OWN shutter button are detected over USB and enter the capture
+            // pipeline automatically (no need to tap this screen).
+            if (cameraSource == "ptp") {
+                Row(
+                    modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(4.dp))
+                        .background(if (physicalShutterSync) CARD else PANEL)
+                        .border(1.dp, if (physicalShutterSync) CYAN else BORDER, RoundedCornerShape(4.dp))
+                        .padding(horizontal = 8.dp, vertical = 2.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Icon(Icons.Default.PhotoCamera, contentDescription = null, tint = if (physicalShutterSync) CYAN else MUTED, modifier = Modifier.size(12.dp))
+                    Text("Shutter Kamera Fisik", style = TextStyle(color = if (physicalShutterSync) CYAN else MUTED, fontSize = 9.sp, fontWeight = FontWeight.Bold), modifier = Modifier.weight(1f))
+                    Switch(
+                        checked = physicalShutterSync,
+                        onCheckedChange = { opViewModel.setPhysicalShutterSync(it) },
+                        colors = SwitchDefaults.colors(
+                            checkedThumbColor = CYAN,
+                            checkedTrackColor = CYAN.copy(alpha = 0.4f),
+                            uncheckedThumbColor = MUTED,
+                            uncheckedTrackColor = BORDER
+                        )
+                    )
                 }
             }
             // Shutter button

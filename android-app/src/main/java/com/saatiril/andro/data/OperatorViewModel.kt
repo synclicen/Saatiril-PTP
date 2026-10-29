@@ -21,6 +21,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -266,6 +267,19 @@ class OperatorViewModel(application: Application) : AndroidViewModel(application
     private val _currentCameraId = MutableStateFlow("")
     val currentCameraId: StateFlow<String> = _currentCameraId.asStateFlow()
 
+    // ─── Physical shutter sync (PTP only) ─────────────────────
+    // When the PTP engine is active and this is ON, photos taken with the
+    // camera's OWN physical shutter button are detected over USB and enter
+    // the normal capture pipeline — the photographer never has to touch the
+    // phone/laptop screen. Default ON (that's the whole point of PTP mode).
+    private val _physicalShutterSync = MutableStateFlow(true)
+    val physicalShutterSync: StateFlow<Boolean> = _physicalShutterSync.asStateFlow()
+
+    fun setPhysicalShutterSync(enabled: Boolean) {
+        _physicalShutterSync.value = enabled
+        Log.i(TAG, "Physical shutter sync: $enabled")
+    }
+
     init {
         // Keep the hoisted flow in sync with whichever engine is active.
         viewModelScope.launch {
@@ -281,6 +295,22 @@ class OperatorViewModel(application: Application) : AndroidViewModel(application
         viewModelScope.launch {
             ptpCameraManager.currentCameraIdFlow.collect { id ->
                 if (_activeCameraEngine.value == "ptp") _currentCameraId.value = id
+            }
+        }
+
+        // Physical shutter sync — watch while PTP is connected AND enabled.
+        viewModelScope.launch {
+            combine(ptpCameraManager.isConnected, _physicalShutterSync) { conn, enabled ->
+                conn && enabled
+            }.collect { active ->
+                if (active) ptpCameraManager.startExternalShutterWatch()
+                else ptpCameraManager.stopExternalShutterWatch()
+            }
+        }
+        // Photos taken with the camera's own physical shutter → normal pipeline.
+        viewModelScope.launch {
+            ptpCameraManager.externalShutterPhotos.collect { dataUrl ->
+                onExternalShutterPhoto(dataUrl)
             }
         }
     }
@@ -655,6 +685,47 @@ class OperatorViewModel(application: Application) : AndroidViewModel(application
             "ptp" -> ptpCameraManager.capturePhoto(captureCallback)
             else -> cameraUVCManager.capturePhoto(captureCallback)
         }
+    }
+
+    /**
+     * A photo taken with the camera's OWN physical shutter button, detected by
+     * the PTP external shutter watch. Routes it through the exact same
+     * processing + delivery pipeline as an app-triggered capture. Gated by
+     * capture phase so a stray shot between students (STANDBY/SENDING) is
+     * ignored instead of mis-attributed.
+     */
+    private fun onExternalShutterPhoto(dataUrl: String) {
+        if (_activeCameraEngine.value != "ptp") return
+        if (!_physicalShutterSync.value) return
+
+        val phase = _capturePhase.value
+        if (phase != CapturePhase.READY_1 && phase != CapturePhase.READY_2) {
+            Log.i(TAG, "onExternalShutterPhoto: ignored — phase=$phase")
+            return
+        }
+        if (_isSending.value) {
+            Log.i(TAG, "onExternalShutterPhoto: ignored — previous photo still sending")
+            return
+        }
+
+        // The shot already happened — an armed timer would trigger a SECOND
+        // capture; cancel it and deliver this photo instead.
+        cancelTimer()
+
+        Log.i(TAG, "onExternalShutterPhoto: accepted (${dataUrl.length} chars), phase=$phase")
+        val config = _project.value?.config
+        val processed = if (config != null) {
+            try {
+                processPhotoWithFrame(dataUrl, config)
+            } catch (e: Exception) {
+                Log.e(TAG, "onExternalShutterPhoto: process failed — ${e.message}")
+                dataUrl
+            }
+        } else {
+            Log.w(TAG, "onExternalShutterPhoto: no config — raw photo without frame")
+            dataUrl
+        }
+        handleCapturedPhoto(processed)
     }
 
     /**
