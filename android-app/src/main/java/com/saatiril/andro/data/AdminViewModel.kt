@@ -12,6 +12,7 @@ import com.google.gson.JsonElement
 import com.google.gson.JsonObject
 import com.saatiril.andro.camera.Camera2Manager
 import com.saatiril.andro.camera.PTPCameraManager
+import com.saatiril.andro.camera.FtpTransferManager
 import com.saatiril.andro.camera.UVCCameraManager
 import com.saatiril.andro.server.ClientInfo
 import com.saatiril.andro.server.SaatirilServer
@@ -104,6 +105,9 @@ class AdminViewModel(application: Application) : AndroidViewModel(application) {
     // PTP: direct DSLR control over USB (Picture Transfer Protocol)
     val ptpCameraManager = PTPCameraManager(application)
 
+    // FTP: WiFi photo transfer engine (camera uploads to this phone — no USB)
+    val ftpManager = FtpTransferManager(application)
+
     /** Combined list of (cameraId, displayName) from all managers (PTP + UVC + Camera2). */
     private val _availableCameras = MutableStateFlow<List<Pair<String, String>>>(emptyList())
     val availableCameras: StateFlow<List<Pair<String, String>>> = _availableCameras.asStateFlow()
@@ -165,11 +169,30 @@ class AdminViewModel(application: Application) : AndroidViewModel(application) {
         val ptpList = ptpCameraManager.availableCameras.value
         val uvcList = cameraUVCManager.availableCameras.value
         val c2List = camera2Manager.availableCameras.value
-        _availableCameras.value = ptpList + uvcList + c2List
+        _availableCameras.value = ptpList + uvcList + c2List +
+            listOf("ftp:wifi" to "Transfer WiFi (FTP)")
     }
 
     /** Switch to a specific camera by ID (handles PTP, UVC, and Camera2). */
     fun switchToCameraById(cameraId: String) {
+        // Leaving the FTP engine → stop its server (idempotent, safe when it
+        // was never started).
+        if (!cameraId.startsWith("ftp:")) {
+            try { ftpManager.stop() } catch (_: Exception) {}
+        }
+
+        // FTP engine — WiFi photo transfer (camera uploads to this phone)
+        if (cameraId.startsWith("ftp:")) {
+            Log.i(TAG, "switchToCameraById: FTP $cameraId")
+            _activeCameraEngine.value = "ftp"
+            try { cameraUVCManager.hidePreview() } catch (_: Exception) {}
+            try { camera2Manager.closeCamera() } catch (_: Exception) {}
+            try { ptpCameraManager.closeCamera() } catch (_: Exception) {}
+            ftpManager.start()
+            _cameraSource.value = "ftp"
+            return
+        }
+
         // PTP camera (ID starts with "ptp:")
         if (cameraId.startsWith("ptp:")) {
             Log.i(TAG, "switchToCameraById: PTP $cameraId")

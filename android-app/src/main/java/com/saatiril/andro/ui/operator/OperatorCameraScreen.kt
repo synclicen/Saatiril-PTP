@@ -159,7 +159,13 @@ fun OperatorCameraScreen(
     val uvcConnected by opViewModel.cameraUVCManager.isConnected.collectAsState()
     val c2Connected by opViewModel.camera2Manager.isConnected.collectAsState()
     val ptpConnected by opViewModel.ptpCameraManager.isConnected.collectAsState()
-    val cameraConnected = when (activeEngine) { "uvc" -> uvcConnected; "camera2" -> c2Connected; else -> ptpConnected }
+    // FTP (WiFi transfer) engine — the camera uploads photos to this phone;
+    // the connected-dot + the passive status card below read off the manager.
+    val ftpClientConnected by opViewModel.ftpManager.clientConnected.collectAsState()
+    val ftpServerAddress by opViewModel.ftpManager.serverAddress.collectAsState()
+    val ftpLastFile by opViewModel.ftpManager.lastFile.collectAsState()
+    val ftpLastError by opViewModel.ftpManager.lastError.collectAsState()
+    val cameraConnected = when (activeEngine) { "uvc" -> uvcConnected; "camera2" -> c2Connected; "ftp" -> ftpClientConnected; else -> ptpConnected }
 
     var showCameraPicker by remember { mutableStateOf(false) }
     var showQueuePanel by remember { mutableStateOf(false) }
@@ -221,6 +227,7 @@ fun OperatorCameraScreen(
             try { opViewModel.camera2Manager.closeCamera() } catch (_: Exception) {}
             try { opViewModel.cameraUVCManager.hidePreview() } catch (_: Exception) {}
             try { opViewModel.ptpCameraManager.closeCamera() } catch (_: Exception) {}
+            try { opViewModel.ftpManager.stop() } catch (_: Exception) {}
             try { HandTriggerDetector.stop() } catch (_: Exception) {}
         }
     }
@@ -404,12 +411,18 @@ fun OperatorCameraScreen(
                     )
                 }
 
-                // No camera signal
+                // No camera signal (the FTP/WiFi engine gets its own waiting hint —
+                // "no signal" just means the camera hasn't connected over WiFi yet)
                 if (!cameraConnected) {
                     Column(modifier = Modifier.align(Alignment.Center), horizontalAlignment = Alignment.CenterHorizontally) {
                         Icon(Icons.Default.VideocamOff, contentDescription = null, tint = MUTED.copy(alpha = 0.5f), modifier = Modifier.size(32.dp))
-                        Text("NO CAMERA SIGNAL", style = TextStyle(color = MUTED, fontSize = 10.sp, fontWeight = FontWeight.Bold))
-                        Text("Pilih kamera atau cek USB", style = TextStyle(color = MUTED.copy(alpha = 0.5f), fontSize = 8.sp))
+                        if (activeEngine == "ftp") {
+                            Text("MENUNGGU KAMERA WIFI", style = TextStyle(color = MUTED, fontSize = 10.sp, fontWeight = FontWeight.Bold))
+                            Text("Nyalakan hotspot HP → hubungkan kamera → tekan shutter di kamera", style = TextStyle(color = MUTED.copy(alpha = 0.5f), fontSize = 8.sp))
+                        } else {
+                            Text("NO CAMERA SIGNAL", style = TextStyle(color = MUTED, fontSize = 10.sp, fontWeight = FontWeight.Bold))
+                            Text("Pilih kamera atau cek USB", style = TextStyle(color = MUTED.copy(alpha = 0.5f), fontSize = 8.sp))
+                        }
                     }
                 }
 
@@ -483,6 +496,7 @@ fun OperatorCameraScreen(
                                             Icon(
                                                 when {
                                                     displayName.contains("PTP", ignoreCase = true) -> Icons.Default.PhotoCamera
+                                                    displayName.contains("WiFi", ignoreCase = true) -> Icons.Default.Wifi
                                                     displayName.contains("USB", ignoreCase = true) -> Icons.Default.Usb
                                                     displayName.contains("Depan", ignoreCase = true) -> Icons.Default.CameraFront
                                                     else -> Icons.Default.CameraAlt
@@ -531,14 +545,17 @@ fun OperatorCameraScreen(
                 Text(phaseLabel, style = TextStyle(color = phaseColor, fontSize = 10.sp, fontWeight = FontWeight.Bold, textAlign = TextAlign.Center), modifier = Modifier.fillMaxWidth())
             }
 
-            // Shutter modes
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(3.dp), verticalAlignment = Alignment.CenterVertically) {
-                listOf("manual" to "M", "timer-3" to "3s", "timer-5" to "5s", "timer-10" to "10s", "hand" to "✋").forEach { (m, label) ->
-                    Card(modifier = Modifier.weight(1f).clip(RoundedCornerShape(4.dp)).clickable { opViewModel.setShutterMode(m) }
-                        .border(1.dp, if (shutterMode == m) GOLD else BORDER, RoundedCornerShape(4.dp)),
-                        colors = CardDefaults.cardColors(containerColor = if (shutterMode == m) CARD else PANEL), shape = RoundedCornerShape(4.dp)) {
-                        Text(label, modifier = Modifier.padding(vertical = 4.dp, horizontal = 2.dp).fillMaxWidth(),
-                            style = TextStyle(color = if (shutterMode == m) GOLD else MUTED, fontSize = 9.sp, fontWeight = FontWeight.Bold, textAlign = TextAlign.Center))
+            // Shutter modes (hidden in FTP/WiFi mode — the camera's OWN shutter
+            // button takes the photo, app-side timer/hand modes don't apply)
+            if (cameraSource != "ftp") {
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(3.dp), verticalAlignment = Alignment.CenterVertically) {
+                    listOf("manual" to "M", "timer-3" to "3s", "timer-5" to "5s", "timer-10" to "10s", "hand" to "✋").forEach { (m, label) ->
+                        Card(modifier = Modifier.weight(1f).clip(RoundedCornerShape(4.dp)).clickable { opViewModel.setShutterMode(m) }
+                            .border(1.dp, if (shutterMode == m) GOLD else BORDER, RoundedCornerShape(4.dp)),
+                            colors = CardDefaults.cardColors(containerColor = if (shutterMode == m) CARD else PANEL), shape = RoundedCornerShape(4.dp)) {
+                            Text(label, modifier = Modifier.padding(vertical = 4.dp, horizontal = 2.dp).fillMaxWidth(),
+                                style = TextStyle(color = if (shutterMode == m) GOLD else MUTED, fontSize = 9.sp, fontWeight = FontWeight.Bold, textAlign = TextAlign.Center))
+                        }
                     }
                 }
             }
@@ -604,21 +621,44 @@ fun OperatorCameraScreen(
                     else -> if (isPhotoshoot) "Foto" else "Toga"
                 }
                 val canCapture = currentTarget != null && capturePhase != CapturePhase.SENDING && !isSending && timerCountdown == 0
-                Button(
-                    onClick = {
-                        if (!canCapture) return@Button
-                        showFlash = true
-                        scope.launch { delay(200); showFlash = false }
-                        opViewModel.triggerCapture()
-                    },
-                    modifier = Modifier.weight(1f).height(48.dp),
-                    colors = ButtonDefaults.buttonColors(containerColor = if (canCapture) GOLD else BORDER),
-                    shape = RoundedCornerShape(8.dp),
-                    enabled = canCapture
-                ) {
-                    if (isSending) { CircularProgressIndicator(modifier = Modifier.size(16.dp), color = BG, strokeWidth = 2.dp); Spacer(Modifier.width(4.dp)); Text("Kirim", color = BG, fontSize = 12.sp, fontWeight = FontWeight.Bold) }
-                    else if (timerCountdown > 0) { Text("$timerCountdown", color = BG, fontSize = 14.sp, fontWeight = FontWeight.Black) }
-                    else { Icon(Icons.Default.PhotoCamera, contentDescription = null, modifier = Modifier.size(20.dp), tint = BG); Spacer(Modifier.width(6.dp)); Text(shutterLabel, color = BG, fontSize = 12.sp, fontWeight = FontWeight.Bold) }
+                if (cameraSource == "ftp") {
+                    // WiFi (FTP) transfer mode — passive status card replaces the
+                    // shutter button: photos are taken with the camera's OWN
+                    // shutter button and arrive over WiFi, there is nothing to
+                    // trigger app-side (same visual language as the PTP rows above).
+                    Row(
+                        modifier = Modifier.weight(1f).heightIn(min = 48.dp).clip(RoundedCornerShape(4.dp))
+                            .background(CARD)
+                            .border(1.dp, CYAN, RoundedCornerShape(4.dp))
+                            .padding(horizontal = 8.dp, vertical = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        Icon(Icons.Default.Wifi, contentDescription = null, tint = CYAN, modifier = Modifier.size(16.dp))
+                        Column(Modifier.weight(1f)) {
+                            Text("Menunggu foto dari kamera…", style = TextStyle(color = CYAN, fontSize = 9.sp, fontWeight = FontWeight.Bold))
+                            Text("FTP ${ftpServerAddress ?: "—"} ${if (ftpClientConnected) "• kamera terhubung" else "• menunggu kamera"}", style = TextStyle(color = MUTED, fontSize = 8.sp))
+                            ftpLastFile?.let { f -> Text("Terakhir: $f", style = TextStyle(color = MUTED, fontSize = 8.sp)) }
+                            ftpLastError?.let { e -> Text(e, style = TextStyle(color = RED, fontSize = 8.sp)) }
+                        }
+                    }
+                } else {
+                    Button(
+                        onClick = {
+                            if (!canCapture) return@Button
+                            showFlash = true
+                            scope.launch { delay(200); showFlash = false }
+                            opViewModel.triggerCapture()
+                        },
+                        modifier = Modifier.weight(1f).height(48.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = if (canCapture) GOLD else BORDER),
+                        shape = RoundedCornerShape(8.dp),
+                        enabled = canCapture
+                    ) {
+                        if (isSending) { CircularProgressIndicator(modifier = Modifier.size(16.dp), color = BG, strokeWidth = 2.dp); Spacer(Modifier.width(4.dp)); Text("Kirim", color = BG, fontSize = 12.sp, fontWeight = FontWeight.Bold) }
+                        else if (timerCountdown > 0) { Text("$timerCountdown", color = BG, fontSize = 14.sp, fontWeight = FontWeight.Black) }
+                        else { Icon(Icons.Default.PhotoCamera, contentDescription = null, modifier = Modifier.size(20.dp), tint = BG); Spacer(Modifier.width(6.dp)); Text(shutterLabel, color = BG, fontSize = 12.sp, fontWeight = FontWeight.Bold) }
+                    }
                 }
                 // Settings toggle
                 Card(modifier = Modifier.size(48.dp).clip(RoundedCornerShape(8.dp)).clickable { showSettingsPanel = !showSettingsPanel }

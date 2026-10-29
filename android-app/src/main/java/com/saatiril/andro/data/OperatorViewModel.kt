@@ -11,6 +11,7 @@ import com.saatiril.andro.camera.Camera2Manager
 import com.saatiril.andro.camera.CameraCapture
 import com.saatiril.andro.camera.HandTriggerDetector
 import com.saatiril.andro.camera.PTPCameraManager
+import com.saatiril.andro.camera.FtpTransferManager
 import com.saatiril.andro.camera.UVCCameraManager
 import com.saatiril.andro.util.FilenameUtils
 import kotlinx.coroutines.CoroutineScope
@@ -71,6 +72,9 @@ class OperatorViewModel(application: Application) : AndroidViewModel(application
 
     // PTP: direct DSLR control over USB (Picture Transfer Protocol)
     val ptpCameraManager = PTPCameraManager(application)
+
+    // FTP: WiFi photo transfer engine (camera uploads to this phone — no USB)
+    val ftpManager = FtpTransferManager(application)
 
     // ─── Connection State ───────────────────────────────────────
 
@@ -318,6 +322,13 @@ class OperatorViewModel(application: Application) : AndroidViewModel(application
                 onExternalShutterPhoto(dataUrl)
             }
         }
+
+        // FTP photos (camera uploads over WiFi) → same pipeline as physical shutter.
+        viewModelScope.launch {
+            ftpManager.ftpPhotos.collect { dataUrl ->
+                onExternalShutterPhoto(dataUrl)
+            }
+        }
     }
 
     // ─── Frame Overlay ──────────────────────────────────────────
@@ -522,6 +533,10 @@ class OperatorViewModel(application: Application) : AndroidViewModel(application
                 _cameraConnected.value = ptpConnected
                 _cameraSource.value = if (ptpConnected) "ptp" else "none"
             }
+            "ftp" -> {
+                _cameraConnected.value = ftpManager.isRunning.value
+                _cameraSource.value = if (ftpManager.isRunning.value) "ftp" else "none"
+            }
             else -> {
                 _cameraConnected.value = uvcConnected
                 _cameraSource.value = if (uvcConnected) "uvc" else "none"
@@ -536,7 +551,8 @@ class OperatorViewModel(application: Application) : AndroidViewModel(application
         val ptpList = ptpCameraManager.availableCameras.value
         val uvcList = cameraUVCManager.availableCameras.value
         val c2List = camera2Manager.availableCameras.value
-        _allAvailableCameras.value = ptpList + uvcList + c2List
+        _allAvailableCameras.value = ptpList + uvcList + c2List +
+            listOf("ftp:wifi" to "Transfer WiFi (FTP)")
     }
 
     fun switchCamera() {
@@ -560,6 +576,26 @@ class OperatorViewModel(application: Application) : AndroidViewModel(application
     }
 
     fun switchToCameraById(cameraId: String) {
+        // Leaving the FTP engine → stop its server (idempotent, safe when it
+        // was never started).
+        if (!cameraId.startsWith("ftp:")) {
+            try { ftpManager.stop() } catch (_: Exception) {}
+        }
+
+        // FTP engine — WiFi photo transfer (camera uploads to this phone)
+        if (cameraId.startsWith("ftp:")) {
+            Log.i(TAG, "switchToCameraById: FTP $cameraId")
+            _activeCameraEngine.value = "ftp"
+            _currentCameraId.value = cameraId
+            try { camera2Manager.closeCamera() } catch (_: Exception) {}
+            try { cameraUVCManager.hidePreview() } catch (_: Exception) {}
+            try { ptpCameraManager.closeCamera() } catch (_: Exception) {}
+            ftpManager.start()
+            _cameraConnected.value = true
+            _cameraSource.value = "ftp"
+            return
+        }
+
         // PTP camera (ID starts with "ptp:")
         if (cameraId.startsWith("ptp:")) {
             Log.i(TAG, "switchToCameraById: Switching to PTP camera $cameraId")
@@ -688,20 +724,23 @@ class OperatorViewModel(application: Application) : AndroidViewModel(application
         when (_activeCameraEngine.value) {
             "camera2" -> camera2Manager.capturePhoto(captureCallback)
             "ptp" -> ptpCameraManager.capturePhoto(captureCallback)
+            "ftp" -> Log.w(TAG, "doCapture: ftp engine — photos arrive from the camera over WiFi; no app-side trigger")
             else -> cameraUVCManager.capturePhoto(captureCallback)
         }
     }
 
     /**
      * A photo taken with the camera's OWN physical shutter button, detected by
-     * the PTP external shutter watch. Routes it through the exact same
-     * processing + delivery pipeline as an app-triggered capture. Gated by
-     * capture phase so a stray shot between students (STANDBY/SENDING) is
-     * ignored instead of mis-attributed.
+     * the PTP external shutter watch, or a photo the camera uploaded over WiFi
+     * (FTP engine). Routes it through the exact same processing + delivery
+     * pipeline as an app-triggered capture. PTP photos are still gated by the
+     * physical shutter sync toggle; FTP photos are always accepted while the
+     * ftp engine is active. Gated by capture phase so a stray shot between
+     * students (STANDBY/SENDING) is ignored instead of mis-attributed.
      */
     private fun onExternalShutterPhoto(dataUrl: String) {
-        if (_activeCameraEngine.value != "ptp") return
-        if (!_physicalShutterSync.value) return
+        if (_activeCameraEngine.value != "ptp" && _activeCameraEngine.value != "ftp") return
+        if (_activeCameraEngine.value == "ptp" && !_physicalShutterSync.value) return
 
         val phase = _capturePhase.value
         if (phase != CapturePhase.READY_1 && phase != CapturePhase.READY_2) {

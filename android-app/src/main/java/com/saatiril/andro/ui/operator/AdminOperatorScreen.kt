@@ -115,12 +115,18 @@ fun AdminOperatorScreen(viewModel: AdminViewModel, modifier: Modifier = Modifier
     val uvcConnected by viewModel.cameraUVCManager.isConnected.collectAsState()
     val c2Connected by viewModel.camera2Manager.isConnected.collectAsState()
     val ptpConnected by viewModel.ptpCameraManager.isConnected.collectAsState()
+    // FTP (WiFi transfer) engine — the camera uploads photos to this phone;
+    // the connected-dot + the passive status card below read off the manager.
+    val ftpClientConnected by viewModel.ftpManager.clientConnected.collectAsState()
+    val ftpServerAddress by viewModel.ftpManager.serverAddress.collectAsState()
+    val ftpLastFile by viewModel.ftpManager.lastFile.collectAsState()
+    val ftpLastError by viewModel.ftpManager.lastError.collectAsState()
     val physicalShutterSync by viewModel.physicalShutterSync.collectAsState()
     val usbSafeMode by viewModel.usbSafeMode.collectAsState()
     val frameBitmap by viewModel.frameBitmap.collectAsState()
     var showCameraPicker by remember { mutableStateOf(false) }
 
-    val cameraConnected = when (activeEngine) { "uvc" -> uvcConnected; "camera2" -> c2Connected; else -> ptpConnected }
+    val cameraConnected = when (activeEngine) { "uvc" -> uvcConnected; "camera2" -> c2Connected; "ftp" -> ftpClientConnected; else -> ptpConnected }
 
     var capturedBitmap by remember { mutableStateOf<android.graphics.Bitmap?>(null) }
     var captureError by remember { mutableStateOf<String?>(null) }
@@ -343,6 +349,27 @@ fun AdminOperatorScreen(viewModel: AdminViewModel, modifier: Modifier = Modifier
         }
     }
 
+    // ── FTP (WiFi transfer) — photos the camera uploads arrive here and are
+    // delivered through the SAME path as on-screen captures.
+    LaunchedEffect(Unit) {
+        viewModel.ftpManager.ftpPhotos.collect { dataUrl ->
+            if (viewModel.activeCameraEngine.value != "ftp") return@collect
+            if (isCapturing) {
+                Log.i("OperatorScreen", "FTP photo skipped — capture already in flight")
+                return@collect
+            }
+            if (timerCountdown != null || timerJob != null) {
+                Log.i("OperatorScreen", "FTP photo — cancelling countdown timer (double-capture guard)")
+                timerJob?.cancel()
+                timerJob = null
+                timerCountdown = null
+            }
+            Log.i("OperatorScreen", "FTP photo (WiFi) → delivering")
+            isCapturing = true
+            deliverPtpPhoto(dataUrl)
+        }
+    }
+
     // ── Hot shoe: extract the capture logic into a reusable lambda ──
     // (used by both the on-screen shutter button + the hot shoe audio detector).
     val triggerCapture: () -> Unit = {
@@ -350,34 +377,42 @@ fun AdminOperatorScreen(viewModel: AdminViewModel, modifier: Modifier = Modifier
             captureError = null
             val timerDuration = when (shutterMode) { "timer-3" -> 3; "timer-5" -> 5; "timer-10" -> 10; else -> 0 }
             val doCapture: () -> Unit = {
-                if (viewModel.activeCameraEngine.value == "ptp" && viewModel.ptpCameraManager.isConnected.value) {
-                    // PTP path: trigger the DSLR shutter over USB, then process
-                    // the full-res photo ASYNC (DSLR autofocus takes seconds).
-                    isCapturing = true
-                    captureError = null
-                    viewModel.ptpCameraManager.capturePhoto { dataUrl ->
-                        if (dataUrl == null) {
-                            val reason = viewModel.ptpCameraManager.lastError.value
-                            captureError = "PTP capture gagal${if (reason != null) ": $reason" else ""}"
-                            isCapturing = false
-                            return@capturePhoto
-                        }
-                        deliverPtpPhoto(dataUrl)
+                when {
+                    viewModel.activeCameraEngine.value == "ftp" -> {
+                        // WiFi engine: photos come from the camera over FTP — there is
+                        // nothing to trigger app-side; surface a hint instead.
+                        captureError = "Mode WiFi: foto diambil dengan shutter kamera (tidak ada tombol app)"
                     }
-                } else {
-                    // Existing Camera2/UVC path — textureView bitmap grab
-                    isCapturing = true
-                    try {
-                        val bitmap = textureView.bitmap
-                        val proj = project
-                        if (bitmap != null && proj != null) {
-                            val processed = try { CameraCapture.processFrame(bitmap, proj.config, frameBitmap) } catch (e: Exception) { bitmap }
-                            val base64 = CameraCapture.bitmapToBase64(processed, 95)
-                            showFlash = true
-                            scope.launch { delay(200); showFlash = false }
-                            viewModel.handleLocalCapture(activeStudent!!, base64, activeChannel)
-                        } else { captureError = if (bitmap == null) "Preview belum siap." else "Proyek tidak ditemukan." }
-                    } catch (e: Exception) { captureError = "Gagal: ${e.message}" } finally { isCapturing = false }
+                    viewModel.activeCameraEngine.value == "ptp" && viewModel.ptpCameraManager.isConnected.value -> {
+                        // PTP path: trigger the DSLR shutter over USB, then process
+                        // the full-res photo ASYNC (DSLR autofocus takes seconds).
+                        isCapturing = true
+                        captureError = null
+                        viewModel.ptpCameraManager.capturePhoto { dataUrl ->
+                            if (dataUrl == null) {
+                                val reason = viewModel.ptpCameraManager.lastError.value
+                                captureError = "PTP capture gagal${if (reason != null) ": $reason" else ""}"
+                                isCapturing = false
+                                return@capturePhoto
+                            }
+                            deliverPtpPhoto(dataUrl)
+                        }
+                    }
+                    else -> {
+                        // Existing Camera2/UVC path — textureView bitmap grab
+                        isCapturing = true
+                        try {
+                            val bitmap = textureView.bitmap
+                            val proj = project
+                            if (bitmap != null && proj != null) {
+                                val processed = try { CameraCapture.processFrame(bitmap, proj.config, frameBitmap) } catch (e: Exception) { bitmap }
+                                val base64 = CameraCapture.bitmapToBase64(processed, 95)
+                                showFlash = true
+                                scope.launch { delay(200); showFlash = false }
+                                viewModel.handleLocalCapture(activeStudent!!, base64, activeChannel)
+                            } else { captureError = if (bitmap == null) "Preview belum siap." else "Proyek tidak ditemukan." }
+                        } catch (e: Exception) { captureError = "Gagal: ${e.message}" } finally { isCapturing = false }
+                    }
                 }
             }
             if (timerDuration > 0) {
@@ -573,6 +608,7 @@ fun AdminOperatorScreen(viewModel: AdminViewModel, modifier: Modifier = Modifier
             try { viewModel.camera2Manager.closeCamera() } catch (_: Exception) {}
             try { viewModel.cameraUVCManager.hidePreview() } catch (_: Exception) {}
             try { viewModel.ptpCameraManager.closeCamera() } catch (_: Exception) {}
+            try { viewModel.ftpManager.stop() } catch (_: Exception) {}
         }
     }
 
@@ -759,7 +795,7 @@ fun AdminOperatorScreen(viewModel: AdminViewModel, modifier: Modifier = Modifier
                 horizontalArrangement = Arrangement.spacedBy(3.dp)
             ) {
                 Box(Modifier.size(5.dp).clip(RoundedCornerShape(2.dp)).background(if (cameraConnected) GREEN else RED))
-                val srcLabel = when (cameraSource) { "uvc" -> "USB"; "builtin" -> "HP"; "ptp" -> "PTP"; else -> "-" }
+                val srcLabel = when (cameraSource) { "uvc" -> "USB"; "builtin" -> "HP"; "ptp" -> "PTP"; "ftp" -> "FTP"; else -> "-" }
                 Text(
                     "Ch.$activeChannel • $srcLabel ${if (cameraConnected) "●" else "○"}",
                     style = TextStyle(color = Color.White, fontSize = 9.sp)
@@ -842,6 +878,7 @@ fun AdminOperatorScreen(viewModel: AdminViewModel, modifier: Modifier = Modifier
                                         Icon(
                                             when {
                                                 displayName.contains("PTP", ignoreCase = true) -> Icons.Default.PhotoCamera
+                                                displayName.contains("WiFi", ignoreCase = true) -> Icons.Default.Wifi
                                                 isUsb -> Icons.Default.Usb
                                                 displayName.contains("Depan", ignoreCase = true) -> Icons.Default.CameraFront
                                                 else -> Icons.Default.CameraAlt
@@ -1061,13 +1098,17 @@ fun AdminOperatorScreen(viewModel: AdminViewModel, modifier: Modifier = Modifier
             verticalArrangement = Arrangement.spacedBy(3.dp)
         ) {
             // Row 1: Shutter modes (compact) — MANUAL / 3s / 5s / 10s / HAND
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(3.dp), verticalAlignment = Alignment.CenterVertically) {
-                listOf("manual" to "M", "timer-3" to "3s", "timer-5" to "5s", "timer-10" to "10s", "hand" to "✋").forEach { (mode, label) ->
-                    Card(modifier = Modifier.weight(1f).clip(RoundedCornerShape(4.dp)).clickable { shutterMode = mode }
-                        .border(1.dp, if (shutterMode == mode) GOLD else BORDER, RoundedCornerShape(4.dp)),
-                        colors = CardDefaults.cardColors(containerColor = if (shutterMode == mode) CARD else PANEL), shape = RoundedCornerShape(4.dp)) {
-                        Text(label, modifier = Modifier.padding(vertical = 4.dp, horizontal = 2.dp).fillMaxWidth(),
-                            style = TextStyle(color = if (shutterMode == mode) GOLD else MUTED, fontSize = 9.sp, fontWeight = FontWeight.Bold, textAlign = TextAlign.Center))
+            // (hidden in FTP/WiFi mode — the camera's OWN shutter button takes
+            // the photo, app-side timer/hand modes don't apply)
+            if (activeEngine != "ftp") {
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(3.dp), verticalAlignment = Alignment.CenterVertically) {
+                    listOf("manual" to "M", "timer-3" to "3s", "timer-5" to "5s", "timer-10" to "10s", "hand" to "✋").forEach { (mode, label) ->
+                        Card(modifier = Modifier.weight(1f).clip(RoundedCornerShape(4.dp)).clickable { shutterMode = mode }
+                            .border(1.dp, if (shutterMode == mode) GOLD else BORDER, RoundedCornerShape(4.dp)),
+                            colors = CardDefaults.cardColors(containerColor = if (shutterMode == mode) CARD else PANEL), shape = RoundedCornerShape(4.dp)) {
+                            Text(label, modifier = Modifier.padding(vertical = 4.dp, horizontal = 2.dp).fillMaxWidth(),
+                                style = TextStyle(color = if (shutterMode == mode) GOLD else MUTED, fontSize = 9.sp, fontWeight = FontWeight.Bold, textAlign = TextAlign.Center))
+                        }
                     }
                 }
             }
@@ -1174,16 +1215,39 @@ fun AdminOperatorScreen(viewModel: AdminViewModel, modifier: Modifier = Modifier
                     capturePhase == CapturePhase.SENDING -> "Kirim"
                     else -> if (CameraModes.isPhotoshootMode(project?.config?.mode ?: CameraModes.SINGLE)) "Foto" else "Toga"
                 }
-                Button(
-                    onClick = { triggerCapture() },
-                    modifier = Modifier.weight(1f).height(60.dp),
-                    colors = ButtonDefaults.buttonColors(containerColor = if (activeStudent != null && !isCapturing && timerCountdown == null) GOLD else BORDER),
-                    shape = RoundedCornerShape(8.dp), enabled = activeStudent != null && !isCapturing && timerCountdown == null,
-                    contentPadding = PaddingValues(horizontal = 6.dp)
-                ) {
-                    if (isCapturing) { CircularProgressIndicator(modifier = Modifier.size(20.dp), color = BG, strokeWidth = 2.dp); Spacer(Modifier.width(6.dp)); Text("Simpan", color = BG, fontSize = 13.sp, fontWeight = FontWeight.Bold) }
-                    else if (timerCountdown != null) { Text("$timerCountdown", color = BG, fontSize = 18.sp, fontWeight = FontWeight.Black) }
-                    else { Icon(Icons.Default.PhotoCamera, contentDescription = null, modifier = Modifier.size(24.dp), tint = BG); Spacer(Modifier.width(6.dp)); Text(shutterLabel, color = BG, fontSize = 14.sp, fontWeight = FontWeight.Bold) }
+                if (activeEngine == "ftp") {
+                    // WiFi (FTP) transfer mode — passive status card replaces the
+                    // shutter button: photos are taken with the camera's OWN
+                    // shutter button and arrive over WiFi, there is nothing to
+                    // trigger app-side (same visual language as the PTP rows above).
+                    Row(
+                        modifier = Modifier.weight(1f).heightIn(min = 60.dp).clip(RoundedCornerShape(4.dp))
+                            .background(CARD)
+                            .border(1.dp, CYAN, RoundedCornerShape(4.dp))
+                            .padding(horizontal = 8.dp, vertical = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        Icon(Icons.Default.Wifi, contentDescription = null, tint = CYAN, modifier = Modifier.size(20.dp))
+                        Column(Modifier.weight(1f)) {
+                            Text("Menunggu foto dari kamera…", style = TextStyle(color = CYAN, fontSize = 9.sp, fontWeight = FontWeight.Bold))
+                            Text("FTP ${ftpServerAddress ?: "—"} ${if (ftpClientConnected) "• kamera terhubung" else "• menunggu kamera"}", style = TextStyle(color = MUTED, fontSize = 8.sp))
+                            ftpLastFile?.let { f -> Text("Terakhir: $f", style = TextStyle(color = MUTED, fontSize = 8.sp)) }
+                            ftpLastError?.let { e -> Text(e, style = TextStyle(color = RED, fontSize = 8.sp)) }
+                        }
+                    }
+                } else {
+                    Button(
+                        onClick = { triggerCapture() },
+                        modifier = Modifier.weight(1f).height(60.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = if (activeStudent != null && !isCapturing && timerCountdown == null) GOLD else BORDER),
+                        shape = RoundedCornerShape(8.dp), enabled = activeStudent != null && !isCapturing && timerCountdown == null,
+                        contentPadding = PaddingValues(horizontal = 6.dp)
+                    ) {
+                        if (isCapturing) { CircularProgressIndicator(modifier = Modifier.size(20.dp), color = BG, strokeWidth = 2.dp); Spacer(Modifier.width(6.dp)); Text("Simpan", color = BG, fontSize = 13.sp, fontWeight = FontWeight.Bold) }
+                        else if (timerCountdown != null) { Text("$timerCountdown", color = BG, fontSize = 18.sp, fontWeight = FontWeight.Black) }
+                        else { Icon(Icons.Default.PhotoCamera, contentDescription = null, modifier = Modifier.size(24.dp), tint = BG); Spacer(Modifier.width(6.dp)); Text(shutterLabel, color = BG, fontSize = 14.sp, fontWeight = FontWeight.Bold) }
+                    }
                 }
                 // Queue toggle — shows/hides inline queue panel BELOW this bar
                 Card(modifier = Modifier.size(42.dp).clip(RoundedCornerShape(8.dp)).clickable { showQueuePanel = !showQueuePanel; showSettingsPanel = false }
