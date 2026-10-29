@@ -116,6 +116,7 @@ fun AdminOperatorScreen(viewModel: AdminViewModel, modifier: Modifier = Modifier
     val c2Connected by viewModel.camera2Manager.isConnected.collectAsState()
     val ptpConnected by viewModel.ptpCameraManager.isConnected.collectAsState()
     val physicalShutterSync by viewModel.physicalShutterSync.collectAsState()
+    val usbSafeMode by viewModel.usbSafeMode.collectAsState()
     val frameBitmap by viewModel.frameBitmap.collectAsState()
     var showCameraPicker by remember { mutableStateOf(false) }
 
@@ -1130,6 +1131,32 @@ fun AdminOperatorScreen(viewModel: AdminViewModel, modifier: Modifier = Modifier
                     Switch(
                         checked = physicalShutterSync,
                         onCheckedChange = { viewModel.setPhysicalShutterSync(it) },
+                        colors = SwitchDefaults.colors(
+                            checkedThumbColor = CYAN,
+                            checkedTrackColor = CYAN.copy(alpha = 0.4f),
+                            uncheckedThumbColor = MUTED,
+                            uncheckedTrackColor = BORDER
+                        )
+                    )
+                }
+            }
+            // Row 1.75: USB safe mode (PTP only) — no interrupt-endpoint reads +
+            // settle delay after claim. Workaround for phones whose USB driver
+            // restarts the phone during PTP transfers. ON by default.
+            if (activeEngine == "ptp") {
+                Row(
+                    modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(4.dp))
+                        .background(if (usbSafeMode) CARD else PANEL)
+                        .border(1.dp, if (usbSafeMode) CYAN else BORDER, RoundedCornerShape(4.dp))
+                        .padding(horizontal = 8.dp, vertical = 2.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Icon(Icons.Default.VerifiedUser, contentDescription = null, tint = if (usbSafeMode) CYAN else MUTED, modifier = Modifier.size(12.dp))
+                    Text("Mode Aman USB", style = TextStyle(color = if (usbSafeMode) CYAN else MUTED, fontSize = 9.sp, fontWeight = FontWeight.Bold), modifier = Modifier.weight(1f))
+                    Switch(
+                        checked = usbSafeMode,
+                        onCheckedChange = { viewModel.setUsbSafeMode(it) },
                         colors = SwitchDefaults.colors(
                             checkedThumbColor = CYAN,
                             checkedTrackColor = CYAN.copy(alpha = 0.4f),

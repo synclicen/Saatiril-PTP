@@ -107,6 +107,21 @@ class PTPCameraManager(private val context: Context) {
         private const val EXTERNAL_SHOT_COOLDOWN_MS = 2500L // burst/bracket protection
         private const val EXTERNAL_RECENT_MS = 15_000L      // handle-dedupe window
 
+        // ── USB safe mode (kernel-panic workaround) ──
+        // Some phone USB host stacks (notably Unisoc / MediaTek chipsets) panic
+        // and reboot the phone when an app reads the PTP INTERRUPT endpoint or
+        // transacts immediately after claiming the interface. Safe mode avoids
+        // both: no interrupt reads (diff-only) + a settle delay after claim.
+        private const val SAFE_MODE_SETTLE_MS = 600L
+        private const val PREFS_NAME = "ptp_camera_prefs"
+        private const val PREF_USB_SAFE_MODE = "usbSafeMode"
+
+        // Shared across manager instances (Operator/Admin each create one) —
+        // a single static flow + one-time prefs read keeps every instance in
+        // sync, so toggling on one screen also protects the other.
+        private val _usbSafeMode = MutableStateFlow(true)
+        @Volatile private var safeModePrefLoaded = false
+
         // Camera VIDs that expose PTP on vendor-specific interfaces
         // (class 0xFF) on older bodies — used only as a detection fallback.
         private val CAMERA_VENDORS = setOf(
@@ -163,6 +178,43 @@ class PTPCameraManager(private val context: Context) {
     private val _externalShutterPhotos = MutableSharedFlow<String>(
         extraBufferCapacity = 4, onBufferOverflow = BufferOverflow.DROP_OLDEST)
     val externalShutterPhotos: SharedFlow<String> = _externalShutterPhotos.asSharedFlow()
+
+    /**
+     * USB safe mode — workaround for phones whose USB host driver panics and
+     * reboots the device during PTP transfers (seen on some Unisoc/MediaTek
+     * phones with Sony cameras). While ON (default):
+     *  - the interrupt endpoint is NEVER read (events come from the
+     *    GetObjectHandles diff instead — works on every camera)
+     *  - the first transaction waits [SAFE_MODE_SETTLE_MS] after claiming the
+     *    interface, letting the kernel settle
+     * Persisted per device; shared by every PTPCameraManager instance.
+     */
+    val usbSafeMode: StateFlow<Boolean> get() = _usbSafeMode.asStateFlow()
+
+    fun setUsbSafeMode(enabled: Boolean) {
+        loadSafeModePref()
+        _usbSafeMode.value = enabled
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit().putBoolean(PREF_USB_SAFE_MODE, enabled).apply()
+        Log.i(TAG, "USB safe mode: $enabled" +
+                if (enabled) " — interrupt reads OFF, diff-only + settle delay" else " — interrupt endpoint enabled")
+    }
+
+    private fun usbSafeModeActive(): Boolean {
+        loadSafeModePref()
+        return _usbSafeMode.value
+    }
+
+    private fun loadSafeModePref() {
+        if (safeModePrefLoaded) return
+        synchronized(CAMERA_VENDORS) {
+            if (safeModePrefLoaded) return
+            _usbSafeMode.value = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .getBoolean(PREF_USB_SAFE_MODE, true)
+            safeModePrefLoaded = true
+            Log.i(TAG, "USB safe mode pref loaded: ${_usbSafeMode.value}")
+        }
+    }
 
     // ══════════════════════════════════════════════════════════════
     // USB plumbing
@@ -513,6 +565,13 @@ class PTPCameraManager(private val context: Context) {
                 pendingResponse = null
                 sessionOpen = false
                 transactionId = 0
+
+                // Safe mode: give the kernel a moment after claimInterface —
+                // some host stacks panic if a bulk transfer starts instantly.
+                if (usbSafeModeActive()) {
+                    Log.i(TAG, "Safe mode ON — settling ${SAFE_MODE_SETTLE_MS}ms before handshake")
+                    Thread.sleep(SAFE_MODE_SETTLE_MS)
+                }
 
                 // Handshake: GetDeviceInfo (pre-session, txId 0) then OpenSession
                 val info = getDeviceInfo()
@@ -918,8 +977,9 @@ class PTPCameraManager(private val context: Context) {
             addedHandles.add(resp.params[2])
         }
 
-        // 3b) Interrupt-endpoint events (the standard path)
-        if (addedHandles.isEmpty() && interruptEp != null) {
+        // 3b) Interrupt-endpoint events (the standard path — skipped in USB
+        //     safe mode, where buggy host drivers can panic on interrupt reads)
+        if (addedHandles.isEmpty() && interruptEp != null && !usbSafeModeActive()) {
             val deadline = System.currentTimeMillis() + EVENT_WAIT_MS
             var lastEventAt = 0L
             while (System.currentTimeMillis() < deadline) {
@@ -1123,8 +1183,11 @@ class PTPCameraManager(private val context: Context) {
         }
         if (isCapturing) return  // performCapture handles its own events
 
-        // 1) Drain pending interrupt events (short timeouts, small budget)
-        if (interruptEp != null) {
+        // 1) Drain pending interrupt events (short timeouts, small budget).
+        //    Skipped in USB safe mode — interrupt reads are the #1 trigger of
+        //    USB host kernel panics on some phones; the diff path below covers
+        //    event-less cameras just as well.
+        if (interruptEp != null && !usbSafeModeActive()) {
             var drained = 0
             while (drained < 4) {
                 val ev = readEvent(50) ?: break

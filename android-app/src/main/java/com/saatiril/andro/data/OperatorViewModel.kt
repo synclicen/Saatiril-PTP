@@ -279,6 +279,11 @@ class OperatorViewModel(application: Application) : AndroidViewModel(application
         _physicalShutterSync.value = enabled
         Log.i(TAG, "Physical shutter sync: $enabled")
     }
+    /** USB safe mode (pass-through to the PTP engine) — see PTPCameraManager.usbSafeMode. */
+    val usbSafeMode: StateFlow<Boolean> get() = ptpCameraManager.usbSafeMode
+
+    fun setUsbSafeMode(enabled: Boolean) = ptpCameraManager.setUsbSafeMode(enabled)
+
 
     init {
         // Keep the hoisted flow in sync with whichever engine is active.
