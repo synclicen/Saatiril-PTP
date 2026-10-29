@@ -94,6 +94,8 @@ fun OperatorCameraScreen(
     val cameraSource by opViewModel.cameraSource.collectAsState()
     val physicalShutterSync by opViewModel.physicalShutterSync.collectAsState()
     val usbSafeMode by opViewModel.usbSafeMode.collectAsState()
+    val usbDisabled by opViewModel.usbDisabled.collectAsState()
+    val usbConnectBlocked by opViewModel.usbConnectBlocked.collectAsState()
     val usbDiag by opViewModel.usbDiag.collectAsState()
     val lastUsbCrashStep by opViewModel.lastUsbCrashStep.collectAsState()
     val currentCameraId by opViewModel.currentCameraId.collectAsState()
@@ -612,6 +614,49 @@ fun OperatorCameraScreen(
                             uncheckedTrackColor = BORDER
                         )
                     )
+                }
+            }
+            // USB kill switch (PTP only) — total opt-out for phones whose
+            // kernel panics on ANY PTP/MTP bulk traffic (phone reboots).
+            // ON = the app never touches usbfs; photos arrive via the
+            // WiFi/FTP engine instead. Auto-locks after 2 detected reboots.
+            if (cameraSource == "ptp") {
+                Row(
+                    modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(4.dp))
+                        .background(if (usbDisabled) CARD else PANEL)
+                        .border(1.dp, if (usbDisabled) RED else BORDER, RoundedCornerShape(4.dp))
+                        .padding(horizontal = 8.dp, vertical = 2.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Icon(Icons.Default.Usb, contentDescription = null, tint = if (usbDisabled) RED else MUTED, modifier = Modifier.size(12.dp))
+                    Text("Nonaktifkan USB" + if (usbDisabled) " (foto via WiFi)" else "",
+                        style = TextStyle(color = if (usbDisabled) RED else MUTED, fontSize = 9.sp, fontWeight = FontWeight.Bold), modifier = Modifier.weight(1f))
+                    Switch(
+                        checked = usbDisabled,
+                        onCheckedChange = { opViewModel.setUsbDisabled(it) },
+                        colors = SwitchDefaults.colors(
+                            checkedThumbColor = RED,
+                            checkedTrackColor = RED.copy(alpha = 0.4f),
+                            uncheckedThumbColor = MUTED,
+                            uncheckedTrackColor = BORDER
+                        )
+                    )
+                }
+            }
+            // Crash-block: camera attached but auto-connect is paused after a
+            // detected USB-driver reboot — the user taps "Hubungkan" to retry.
+            if (cameraSource == "ptp" && usbConnectBlocked && !usbDisabled) {
+                Row(
+                    modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(4.dp))
+                        .background(CARD).border(1.dp, CYAN, RoundedCornerShape(4.dp))
+                        .clickable { opViewModel.userRequestedUsbConnect() }
+                        .padding(horizontal = 8.dp, vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Icon(Icons.Default.Refresh, contentDescription = null, tint = CYAN, modifier = Modifier.size(12.dp))
+                    Text("USB ditunda setelah restart — ketuk untuk Hubungkan", style = TextStyle(color = CYAN, fontSize = 9.sp, fontWeight = FontWeight.Bold), modifier = Modifier.weight(1f))
                 }
             }
             // Live USB pipeline diagnostics + reboot forensics (PTP only)

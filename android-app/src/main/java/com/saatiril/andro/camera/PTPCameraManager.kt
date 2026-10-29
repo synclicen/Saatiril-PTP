@@ -19,6 +19,7 @@ import android.hardware.usb.UsbInterface
 import android.hardware.usb.UsbManager
 import android.os.Build
 import android.os.Handler
+import android.os.SystemClock
 import android.os.HandlerThread
 import android.os.Looper
 import android.util.Log
@@ -136,12 +137,27 @@ class PTPCameraManager(private val context: Context) {
         private const val PREF_USB_SAFE_MODE = "usbSafeMode"
         private const val PREF_DIAG_STEP = "usbDiagStep"
         private const val PREF_DIAG_AT = "usbDiagAt"
+        private const val PREF_DIAG_UPTIME = "usbDiagUptime"
+        private const val PREF_USB_DISABLED = "usbDisabled"
+        private const val PREF_CRASH_COUNT = "usbCrashCount"
+        private const val PREF_CRASH_BLOCK_UNTIL = "usbCrashBlockUntil"
+
+        /** After a detected USB-driver reboot: pause auto-connect for this
+         *  long — the user must explicitly tap "Hubungkan" to retry sooner. */
+        private const val CRASH_BLOCK_MS = 15 * 60_000L
 
         // Shared across manager instances (Operator/Admin each create one) —
         // a single static flow + one-time prefs read keeps every instance in
         // sync, so toggling on one screen also protects the other.
         private val _usbSafeMode = MutableStateFlow(true)
         @Volatile private var safeModePrefLoaded = false
+
+        /** USB kill switch — when ON the PTP engine NEVER touches usbfs (no
+         *  permission requests, no openDevice, no polling). For phones whose
+         *  kernel panics on ANY PTP/MTP bulk access; photos then arrive via
+         *  the FTP engine (WiFi hotspot or USB tethering) instead. */
+        private val _usbDisabled = MutableStateFlow(false)
+        @Volatile private var usbDisabledPrefLoaded = false
 
         // Camera VIDs that expose PTP on vendor-specific interfaces
         // (class 0xFF) on older bodies — used only as a detection fallback.
@@ -219,6 +235,86 @@ class PTPCameraManager(private val context: Context) {
                 if (enabled) " — no interrupt reads, polite claim, 16KB paced chunks, 3s watch" else " — interrupt endpoint + fast path enabled")
     }
 
+    /** USB kill switch (companion [_usbDisabled]). Turning it back OFF also
+     *  clears the crash block + counter — explicit user intent to retry USB. */
+    val usbDisabled: StateFlow<Boolean> get() = _usbDisabled.asStateFlow()
+
+    /**
+     * True while a PTP camera is attached but auto-connect is paused after a
+     * detected USB-driver reboot (the crash-block window). The UI shows a
+     * "Hubungkan" button that calls [userRequestedConnect].
+     */
+    private val _usbConnectBlocked = MutableStateFlow(false)
+    val usbConnectBlocked: StateFlow<Boolean> = _usbConnectBlocked.asStateFlow()
+
+    /** Wall-clock end of the crash block (ms epoch; mirrors the pref). */
+    @Volatile private var crashBlockUntil = 0L
+
+    fun setUsbDisabled(disabled: Boolean) {
+        loadUsbDisabledPref()
+        _usbDisabled.value = disabled
+        crashBlockUntil = 0L
+        _usbConnectBlocked.value = false
+        try {
+            context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
+                .putBoolean(PREF_USB_DISABLED, disabled)
+                .putInt(PREF_CRASH_COUNT, 0)
+                .putLong(PREF_CRASH_BLOCK_UNTIL, 0L)
+                .commit()
+        } catch (_: Exception) {}
+        Log.i(TAG, "USB kill switch: disabled=$disabled")
+        // Re-enabled → look for the camera right away instead of waiting for
+        // the next attach event / periodic scan.
+        if (!disabled && initialized) {
+            mainHandler.post {
+                try { scanDeviceList() } catch (e: Exception) {
+                    Log.e(TAG, "setUsbDisabled rescan: ${e.message}")
+                }
+            }
+        }
+    }
+
+    /** Manual "Hubungkan USB" tap — clears the crash block and reconnects. */
+    fun userRequestedConnect() {
+        Log.i(TAG, "userRequestedConnect — clearing crash block")
+        crashBlockUntil = 0L
+        _usbConnectBlocked.value = false
+        try {
+            context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
+                .putLong(PREF_CRASH_BLOCK_UNTIL, 0L)
+                .putInt(PREF_CRASH_COUNT, 0)
+                .apply()
+        } catch (_: Exception) {}
+        if (!initialized) return
+        mainHandler.post {
+            try { scanDeviceList() } catch (e: Exception) {
+                Log.e(TAG, "userRequestedConnect: ${e.message}")
+            }
+        }
+    }
+
+    private fun usbDisabledActive(): Boolean {
+        loadUsbDisabledPref()
+        return _usbDisabled.value
+    }
+
+    private fun loadUsbDisabledPref() {
+        if (usbDisabledPrefLoaded) return
+        synchronized(CAMERA_VENDORS) {
+            if (usbDisabledPrefLoaded) return
+            val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            _usbDisabled.value = prefs.getBoolean(PREF_USB_DISABLED, false)
+            crashBlockUntil = prefs.getLong(PREF_CRASH_BLOCK_UNTIL, 0L)
+            usbDisabledPrefLoaded = true
+            Log.i(TAG, "USB kill-switch pref loaded: disabled=${_usbDisabled.value}")
+        }
+    }
+
+    private fun crashBlocked(): Boolean {
+        loadUsbDisabledPref()
+        return crashBlockUntil > System.currentTimeMillis()
+    }
+
     /**
      * Live human-readable progress of the USB connection ("membuka perangkat
      * USB…", "handshake OpenSession…", "siap — transfer USB aktif"). Recorded
@@ -247,7 +343,9 @@ class PTPCameraManager(private val context: Context) {
         "opensession" -> "handshake OpenSession"
         "unduh" -> "mengunduh foto"
         "capture" -> "capture dari aplikasi"
+        "pemantauan" -> "memantau shutter kamera"
         "siap" -> "siap — transfer USB aktif"
+        "locked" -> "USB nonaktif — nyalakan kembali untuk PTP"
         else -> "menunggu kabel USB"
     }
 
@@ -259,25 +357,61 @@ class PTPCameraManager(private val context: Context) {
     private fun setDiag(step: String) {
         _usbDiag.value = diagText(step)
         try {
+            // commit() (synchronous): apply() can lose the very last write when
+            // the kernel panics — exactly the write the forensics depends on.
+            // Uptime is recorded alongside: if uptime went BACKWARDS on the
+            // next start, the phone physically rebooted (deterministic check —
+            // no false positives from the user merely restarting the app).
             context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
                 .putString(PREF_DIAG_STEP, step)
                 .putLong(PREF_DIAG_AT, System.currentTimeMillis())
-                .apply()
+                .putLong(PREF_DIAG_UPTIME, SystemClock.elapsedRealtime())
+                .commit()
         } catch (_: Exception) {}
     }
 
-    /** After a reboot: if the last persisted step was mid-operation and recent,
-     *  the phone died during it — surface that step for the user to report. */
+    /** After a reboot: if the last persisted step was mid-operation, the phone
+     *  PHYSICALLY rebooted (uptime went backwards) and it all happened inside
+     *  the forensics window — surface that step for the user to report and
+     *  count it toward the USB auto-lock. A mere app restart (same boot) never
+     *  counts: the persisted uptime is then <= the current one. */
     private fun detectPriorCrash() {
         try {
+            loadUsbDisabledPref()
             val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             val step = prefs.getString(PREF_DIAG_STEP, "idle") ?: "idle"
             val at = prefs.getLong(PREF_DIAG_AT, 0L)
-            val midOp = step.isNotBlank() && step !in setOf("idle", "siap")
-            if (midOp && System.currentTimeMillis() - at < CRASH_HINT_WINDOW_MS) {
-                _lastCrashStep.value = diagText(step)
-                Log.w(TAG, "Previous run died mid-USB-op '$step' " +
-                        "${(System.currentTimeMillis() - at) / 1000}s ago — likely a USB-driver reboot")
+            val upAt = prefs.getLong(PREF_DIAG_UPTIME, 0L)
+            // Uptime went backwards → the phone itself rebooted since the write.
+            val phoneRebooted = upAt > SystemClock.elapsedRealtime()
+            val midOp = step.isNotBlank() && step !in setOf("idle", "siap", "locked")
+            if (midOp && phoneRebooted && System.currentTimeMillis() - at < CRASH_HINT_WINDOW_MS) {
+                // Reboot during a USB op — count it; 2 crashes without a clean
+                // shutdown in between auto-lock USB so the phone stays usable
+                // (photos keep flowing via the WiFi/USB-tethering FTP engine).
+                val count = prefs.getInt(PREF_CRASH_COUNT, 0) + 1
+                var note = ""
+                if (count >= 2 && !_usbDisabled.value) {
+                    setUsbDisabled(true)
+                    note = " — USB dimatikan otomatis agar ponsel stabil (pakai Transfer WiFi/FTP)"
+                }
+                crashBlockUntil = System.currentTimeMillis() + CRASH_BLOCK_MS
+                prefs.edit()
+                    .putInt(PREF_CRASH_COUNT, count)
+                    .putLong(PREF_CRASH_BLOCK_UNTIL, crashBlockUntil)
+                    .commit()
+                _lastCrashStep.value = diagText(step) + note
+                Log.w(TAG, "USB-driver reboot detected: died mid-op '$step' " +
+                        "${(System.currentTimeMillis() - at) / 1000}s ago (crash #$count)")
+            } else if (midOp && !phoneRebooted) {
+                // App restarted normally while the phone stayed up — the mid-op
+                // step is stale, not a crash. Clear it so a much later manual
+                // reboot can't false-positive off it.
+                prefs.edit().putString(PREF_DIAG_STEP, "idle").commit()
+                prefs.edit().putInt(PREF_CRASH_COUNT, 0).apply()
+            } else if (!midOp) {
+                // Clean shutdown since the last crash — reset the counter.
+                prefs.edit().putInt(PREF_CRASH_COUNT, 0).apply()
             }
         } catch (_: Exception) {}
     }
@@ -434,6 +568,18 @@ class PTPCameraManager(private val context: Context) {
      * ones, request permission for newcomers, auto-connect when idle.
      */
     private fun scanDeviceList() {
+        // Kill switch: never touch usbfs at all — list nothing, connect nothing.
+        if (usbDisabledActive()) {
+            if (devices.isNotEmpty() || activeDeviceId != -1) {
+                devices.clear()
+                rebuildAvailableCameras()
+                if (activeDeviceId != -1) disconnectCurrent()
+            }
+            _usbConnectBlocked.value = false
+            _usbDiag.value = diagText("locked")
+            return
+        }
+        val blocked = crashBlocked()
         val ptpDevices = usbManager.deviceList.values.filter { isPTPDevice(it) }
         val seenIds = HashSet<Int>()
 
@@ -444,6 +590,9 @@ class PTPCameraManager(private val context: Context) {
                 devices[device.deviceId] = device
                 rebuildAvailableCameras()
             }
+            // Crash-block window: list the camera but hold off — the phone just
+            // rebooted mid-USB-op; the user must explicitly tap "Hubungkan".
+            if (blocked) continue
             // Ask for permission if we don't have it yet (only once per device)
             if (!usbManager.hasPermission(device) && permissionRequested.putIfAbsent(device.deviceId, true) == null) {
                 requestPermission(device)
@@ -451,6 +600,7 @@ class PTPCameraManager(private val context: Context) {
                 connectDevice(device)
             }
         }
+        _usbConnectBlocked.value = blocked && devices.isNotEmpty()
 
         // Drop devices that are no longer attached
         val removed = devices.keys.filter { it !in seenIds }
@@ -462,7 +612,7 @@ class PTPCameraManager(private val context: Context) {
                 disconnectCurrent()
                 // Auto-connect the next remaining PTP camera, if any
                 nextAttachedCamera()?.let { next ->
-                    if (usbManager.hasPermission(next)) connectDevice(next)
+                    if (usbManager.hasPermission(next) && !crashBlocked() && !usbDisabledActive()) connectDevice(next)
                 }
             }
             rebuildAvailableCameras()
@@ -478,7 +628,7 @@ class PTPCameraManager(private val context: Context) {
             when (intent.action) {
                 UsbManager.ACTION_USB_DEVICE_ATTACHED -> {
                     val device = intent.getParcelableExtra<UsbDevice>(UsbManager.EXTRA_DEVICE) ?: return
-                    if (isPTPDevice(device)) {
+                    if (isPTPDevice(device) && !usbDisabledActive()) {
                         Log.i(TAG, "PTP device ATTACHED: ${device.deviceName}")
                         devices[device.deviceId] = device
                         rebuildAvailableCameras()
@@ -486,7 +636,7 @@ class PTPCameraManager(private val context: Context) {
                             if (permissionRequested.putIfAbsent(device.deviceId, true) == null) {
                                 requestPermission(device)
                             }
-                        } else if (activeDeviceId == -1) {
+                        } else if (activeDeviceId == -1 && !crashBlocked()) {
                             connectDevice(device)
                         }
                     }
@@ -500,7 +650,7 @@ class PTPCameraManager(private val context: Context) {
                         if (device.deviceId == activeDeviceId) {
                             disconnectCurrent()
                             nextAttachedCamera()?.let { next ->
-                                if (usbManager.hasPermission(next)) connectDevice(next)
+                                if (usbManager.hasPermission(next) && !crashBlocked() && !usbDisabledActive()) connectDevice(next)
                             }
                         }
                         rebuildAvailableCameras()
@@ -517,7 +667,7 @@ class PTPCameraManager(private val context: Context) {
             val device = intent.getParcelableExtra<UsbDevice>(UsbManager.EXTRA_DEVICE) ?: return
             val granted = intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)
             Log.i(TAG, "USB permission for ${device.deviceName}: granted=$granted")
-            if (granted && activeDeviceId == -1) {
+            if (granted && activeDeviceId == -1 && !usbDisabledActive() && !crashBlocked()) {
                 connectDevice(device)
             }
         }
@@ -1337,7 +1487,10 @@ class PTPCameraManager(private val context: Context) {
         }
 
         // 2) GetObjectHandles diff — universal fallback (also catches cameras
-        //    that don't emit events to an idle host)
+        //    that don't emit events to an idle host). Persist the step BEFORE
+        //    the bulk read: a kernel panic during this 3s poll previously left
+        //    "siap" on disk and the crash was invisible to the forensics.
+        setDiag("pemantauan")
         val nowHandles = objectHandles() ?: return
         val base = knownHandles
         if (base == null) {
@@ -1346,6 +1499,10 @@ class PTPCameraManager(private val context: Context) {
         }
         val fresh = nowHandles - base
         knownHandles = nowHandles
+        if (fresh.isEmpty()) {
+            if (connection != null && sessionOpen) setDiag("siap")
+            return
+        }
         for (h in fresh) onExternalObject(h)
     }
 
@@ -1500,6 +1657,13 @@ class PTPCameraManager(private val context: Context) {
 
     /** Switch to a specific PTP camera by id ("ptp:<usbDeviceId>"). */
     fun switchCamera(cameraId: String) {
+        if (usbDisabledActive()) {
+            _lastError.value = "USB dinonaktifkan — matikan switch \"Nonaktifkan USB\" untuk memakai PTP"
+            Log.w(TAG, "switchCamera: blocked — USB kill switch is ON")
+            return
+        }
+        // Explicit user action = consent: clear any crash block first.
+        if (crashBlocked()) userRequestedConnect()
         val idPart = cameraId.removePrefix("ptp:").toIntOrNull() ?: run {
             Log.w(TAG, "switchCamera: bad id '$cameraId'")
             return

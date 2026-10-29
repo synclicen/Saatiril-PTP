@@ -147,6 +147,18 @@ class AdminViewModel(application: Application) : AndroidViewModel(application) {
 
     fun setUsbSafeMode(enabled: Boolean) = ptpCameraManager.setUsbSafeMode(enabled)
 
+    /** USB kill switch — True = the PTP engine never touches usbfs at all
+     *  (phones whose kernel panics on PTP bulk traffic; use the FTP engine). */
+    val usbDisabled: StateFlow<Boolean> get() = ptpCameraManager.usbDisabled
+
+    fun setUsbDisabled(disabled: Boolean) = ptpCameraManager.setUsbDisabled(disabled)
+
+    /** True while a camera is attached but auto-connect is paused after a
+     *  detected USB-driver reboot — the UI offers a "Hubungkan" button. */
+    val usbConnectBlocked: StateFlow<Boolean> get() = ptpCameraManager.usbConnectBlocked
+
+    fun userRequestedUsbConnect() = ptpCameraManager.userRequestedConnect()
+
     /** Live USB pipeline step, user-facing Indonesian (diagnostics) — see PTPCameraManager.usbDiag. */
     val usbDiag: StateFlow<String?> get() = ptpCameraManager.usbDiag
 
